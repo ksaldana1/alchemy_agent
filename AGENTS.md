@@ -26,7 +26,7 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   `newsroom:demo <url> submit|poison` is M6's deployed check; `publish`, `approve`, and `stale` are M7's.
   M8's acceptance test: `bun run newsroom:test[:cloud]` (scripted model, chaos). The end-to-end run on a
   stage: `bun run newsroom:run <url>`. The refund desk (planted crashes, exactly-once side effects):
-  `bun run refunds:demo[:cloud]`, or `refunds:deploy|destroy` with Workers AI.
+  `bun run refunds:ui` (a live page, local), `refunds:demo[:cloud]` (narrated test), or `refunds:deploy|destroy` with Workers AI.
 - `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
   replaces the live Worker with a local one.
 - The public API follows `effect/cluster`'s `Entity`: `Rpc` contracts in `Agent.make(type, [rpcs])`,

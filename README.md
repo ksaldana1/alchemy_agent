@@ -20,6 +20,7 @@ or a script connected over HTTP.
 To see what that buys you, run the [refund desk demo](examples/refunds). An agent issues
 refunds while the demo crashes it at the worst moment: after the payment gateway moved the money,
 before the agent recorded it. It still issues each refund once and sends each email once.
+`bun run refunds:ui` opens it as a live page you can click through.
 
 > **Early release:** the API may change. Use the exact Effect and Alchemy versions below;
 > the library currently requires `effect@4.1.5` and Alchemy `2.0.0-beta.87`.
@@ -327,7 +328,7 @@ side effects are not. Read the [execution rules](docs/GUIDE.md#rules-to-know) be
 | Wait for a person's decision | [Human requests](docs/GUIDE.md#human-requests) |
 | Start work from an upload or schedule | [Listeners](docs/GUIDE.md#listeners) |
 | Integrate with another application | [HTTP API](docs/GUIDE.md#the-platform-and-its-http-api) · [Script clients](docs/GUIDE.md#from-scripts) |
-| Run side effects exactly once through crashes and retries | [Refund desk example](examples/refunds) · [Demo](examples/refunds/test/demo.test.ts) |
+| Run side effects exactly once through crashes and retries | [Refund desk example](examples/refunds) · [Demo test](examples/refunds/test/demo.test.ts) |
 | Test with scripted models and simulated crashes | [Testing](docs/GUIDE.md#testing) |
 | See the pieces working together | [Newsroom example](examples/newsroom) · [Acceptance test](examples/newsroom/test/newsroom.test.ts) |
 

@@ -4,6 +4,7 @@
     "src",
     "scripts",
     "test",
+    "demo",
     "*.ts"
   ]
 }

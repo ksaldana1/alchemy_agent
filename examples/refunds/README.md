@@ -5,13 +5,15 @@ library is for: work with side effects that must happen **once**, even when the 
 dies partway through.
 
 ```sh
-bun run refunds:demo         # local workerd, about 30 seconds, no LLM
+bun run refunds:ui           # a live page at http://localhost:1337: click through it yourself
+bun run refunds:demo         # the same story narrated in the terminal, about 30 seconds
 ```
 
-It runs from a checkout of this repository, after `bun install`. It also needs a Cloudflare account
-connected to Alchemy (see the [Hello example](../../README.md#try-the-hello-example)), because the
-stack keeps its state in Cloudflare. The demo deploys nothing to Cloudflare and tears itself down
-when it's done.
+Both run locally on workerd with a scripted model, so there's no LLM bill. They run from a checkout
+of this repository, after `bun install`. They also need a Cloudflare account connected to Alchemy
+(see the [Hello example](../../README.md#try-the-hello-example)), because the stack keeps its state
+in Cloudflare. Nothing is deployed to Cloudflare. `refunds:demo` tears itself down when it's done;
+stop `refunds:ui` with Ctrl-C.
 
 ## The agents
 
@@ -27,19 +29,32 @@ actually reached them.
 
 ## What the demo does
 
-`test/platform.ts` runs the same agents with a scripted model and two planted failures:
+`demo/platform.ts` runs the same agents with a scripted model and one planted failure, at **the
+worst moment to crash**. The gateway refunds the order, then the Payments agent dies before it
+records the answer, as an eviction, a CPU limit, or a deploy would. The task is delivered again
+with the same id, so the gateway sees the same idempotency key and returns the refund it already
+made. The crash is armed per order: the page has a checkbox for it, and the terminal demo arms it
+for the first order.
 
-1. **The worst moment to crash.** The gateway refunds the first order, then the Payments agent
-   dies before it records the answer, as an eviction, a CPU limit, or a deploy would cause. The
-   task is delivered again with the same id, so the gateway sees the same idempotency key and
-   returns the refund it already made.
-2. **The mailer dies** as its first email starts. It's delivered again and sent once.
+### The page (`refunds:ui`)
 
-Then it sends four requests:
+Pick a preset or write your own request, then watch each order's steps update live: the model,
+the manager's approval, each call to Payments and Mailer with how many times it was delivered,
+and the outcome. Approve or decline big refunds in the manager's queue, and press **Send again**
+on an order to send a duplicate. The **Outside world** panel counts what reached the gateway and
+the email provider. When a crash caused a redelivery, it shows more gateway requests than
+refunds, and says why.
+
+The API token is `demo-token`. The page is plain HTML and JavaScript (`demo/page.ts`) that polls
+the same HTTP API a script would use.
+
+### The terminal (`refunds:demo`)
+
+It sends four requests:
 
 | Order | Amount | What happens |
 | --- | --- | --- |
-| Pour-over kettle | $34 | Approved by policy, through both crashes. |
+| Pour-over kettle | $34 | Approved by policy, through the planted crash. |
 | Espresso machine | $649 | Waits for a manager. The task is `waiting`, and no code runs until the answer comes. |
 | Linen throw | $89 | The model finds it outside the policy: no refund, a decline email. |
 | The kettle again | | A duplicate. Same order, same task, same answer. |

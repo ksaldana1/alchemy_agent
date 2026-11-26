@@ -1,4 +1,6 @@
-// The demo's stack (scripted model, planned failures). `bun run refunds:demo`.
+// The demo's stack: the refund desk with a scripted model, crashes on demand, and a live page.
+//   bun run refunds:ui     open it in a browser (alchemy dev, local)
+//   bun run refunds:demo   the narrated run in the terminal, which is also the example's test
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
 import * as Effect from "effect/Effect";

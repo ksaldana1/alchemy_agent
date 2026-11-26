@@ -4,11 +4,12 @@
 //   bun run refunds:demo          local (workerd), no LLM, no Cloudflare resources left behind
 //   bun run refunds:demo:cloud    the same on a real test_$USER stage, destroyed afterwards
 //
-// What goes wrong (test/platform.ts):
+// What goes wrong (demo/platform.ts):
 //   - The payment gateway refunds the first order, and the Payments agent dies before it records
 //     the answer. The task is delivered again.
-//   - The mailer dies as its first email starts.
 //   - The same request arrives twice.
+//
+// `bun run refunds:ui` runs the same stack with a page to click through it yourself.
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Test from "@alchemy.run/test/Bun";
 import { Api, Platform } from "alchemy-agent";
@@ -17,7 +18,8 @@ import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import { dollars } from "../src/agents.ts";
 import { RefundDesk, type RefundRequest } from "../src/contracts.ts";
-import Stack from "./stack.ts";
+import { crashMarker } from "../demo/platform.ts";
+import Stack from "../demo/stack.ts";
 
 process.env[Api.TOKEN_ENV] ??= "test-token";
 const token = process.env[Api.TOKEN_ENV]!;
@@ -64,7 +66,7 @@ test(
       say(`1. Order ${KETTLE.orderId}: ${KETTLE.item}, ${dollars(KETTLE.amount)}. "${KETTLE.reason}"`);
       step("Under the approval limit, so policy approves it.");
       step("Planted failure: the gateway refunds it, then Payments dies before recording the answer.");
-      step("Planted failure: the mailer dies as it starts sending.");
+      yield* platform.files.write(crashMarker(KETTLE.orderId), "armed");
       const kettle = yield* desk.RequestRefund(KETTLE);
       step(`→ ${kettle.status} ${dollars(kettle.amount)} (${kettle.refundId}), and the customer was emailed.`);
       expect(kettle).toMatchObject({ status: "refunded", amount: KETTLE.amount, decidedBy: "policy" });
@@ -107,14 +109,14 @@ test(
       say("What reached the outside world:");
       step(`Payment gateway: ${gatewayRequests.length} requests, ${refunds.length} refunds issued.`);
       step(`  The first refund's task was delivered ${payments[0]?.attempts} times, with the same idempotency key, so the gateway returned the refund it had already made.`);
-      step(`Email provider: ${emails.length} emails sent, for ${mails.length} send tasks (the first was delivered ${mails[0]?.attempts} times).`);
+      step(`Email provider: ${emails.length} emails sent, one per order.`);
       say();
 
       expect(refunds.length).toBe(2);
       expect(gatewayRequests.length).toBe(3);
       expect(payments.map((t) => t.attempts)).toEqual([2, 1]);
       expect(emails.length).toBe(3);
-      expect(mails.map((t) => t.attempts)).toEqual([2, 1, 1]);
+      expect(mails.length).toBe(3);
     }).pipe(Effect.provide(Platform.connect({ url: url!, token })), Effect.scoped);
   }),
   { timeout: 300_000 },

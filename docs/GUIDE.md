@@ -500,7 +500,7 @@ test("greets", Effect.gen(function* () {
   `Testing.count(name)` is a durable counter for asserting how many times something really ran.
   Together they can plant a crash at the worst moment: the refund desk's demo wraps its payment
   gateway so the first refund goes through and the agent dies before recording it
-  ([`test/platform.ts`](../examples/refunds/test/platform.ts)).
+  ([`demo/platform.ts`](../examples/refunds/demo/platform.ts)).
 
 ---
 
@@ -539,7 +539,7 @@ test("greets", Effect.gen(function* () {
 |---|---|
 | [`examples/hello`](../examples/hello) | Agents, retries, keyed tasks, agents waiting on agents |
 | [`examples/support-desk`](../examples/support-desk) | LLM agents on Workers AI, tools that call other agents, the workspace |
-| [`examples/refunds`](../examples/refunds) | Exactly-once side effects: an LLM agent, a manager's approval, a payment gateway and email with idempotency keys, and a narrated demo that crashes the agent at the worst moment (`bun run refunds:demo`) |
+| [`examples/refunds`](../examples/refunds) | Exactly-once side effects: an LLM agent, a manager's approval, a payment gateway and email with idempotency keys, and a live demo page that crashes the agent at the worst moment (`bun run refunds:ui`, or `refunds:demo` in the terminal) |
 | [`examples/newsroom`](../examples/newsroom) | Everything together: listener → workflow → LLM editor and reviewers → human sign-off → publish, plus an acceptance test under chaos |
 
 The newsroom's [`test/newsroom.test.ts`](../examples/newsroom/test/newsroom.test.ts) and
