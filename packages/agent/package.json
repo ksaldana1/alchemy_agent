@@ -1,11 +1,36 @@
 {
   "name": "alchemy-agent",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
+  "description": "Persistent, durable agents on Cloudflare with Effect and Alchemy",
+  "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ksaldana1/alchemy_agent.git",
+    "directory": "packages/agent"
+  },
+  "homepage": "https://github.com/ksaldana1/alchemy_agent#readme",
+  "bugs": "https://github.com/ksaldana1/alchemy_agent/issues",
+  "keywords": [
+    "effect",
+    "alchemy",
+    "cloudflare",
+    "durable-objects",
+    "agents",
+    "workers"
+  ],
+  "sideEffects": false,
   "exports": {
     ".": "./src/index.ts",
     "./testing": "./src/Testing.ts"
+  },
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "release": "bun run build && npm publish dist"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@alchemy.run/cloudflare": "2.0.0-beta.87",
