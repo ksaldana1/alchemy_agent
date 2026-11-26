@@ -48,6 +48,19 @@ refunds, and says why.
 The API token is `demo-token`. The page is plain HTML and JavaScript (`demo/page.ts`) that polls
 the same HTTP API a script would use.
 
+To share it, deploy the page to the `demo_$USER` stage. Put a long random `AGENT_API_TOKEN` in
+`examples/refunds/.env` first. The token is the only lock on the whole API, so don't use
+`demo-token`. Then:
+
+```sh
+bun run refunds:ui:deploy --yes    # prints the URL
+bun run refunds:ui:destroy --yes   # when you're done
+```
+
+Share it as `https://<url>/#token=<token>`. The page reads the token from the part after `#`, which
+browsers don't send to servers or put in logs. Everyone with the link uses the same desk and sees
+every order.
+
 ### The terminal (`refunds:demo`)
 
 It sends four requests:

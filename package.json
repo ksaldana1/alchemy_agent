@@ -39,6 +39,9 @@
     "refunds:deploy": "bun --cwd examples/refunds --bun alchemy deploy --stage dev_$USER",
     "refunds:destroy": "bun --cwd examples/refunds --bun alchemy destroy --stage dev_$USER",
     "refunds:ui": "cd examples/refunds && AGENT_API_TOKEN=demo-token bun --bun alchemy dev demo/stack.ts --stage local_$USER",
+    "refunds:ui:deploy": "bun --cwd examples/refunds --bun alchemy deploy demo/stack.ts --stage demo_$USER",
+    "refunds:ui:plan": "bun --cwd examples/refunds --bun alchemy plan demo/stack.ts --stage demo_$USER",
+    "refunds:ui:destroy": "bun --cwd examples/refunds --bun alchemy destroy demo/stack.ts --stage demo_$USER",
     "refunds:demo": "cd examples/refunds && ALCHEMY_TEST_DEV=1 ALCHEMY_LOG_LEVEL=error bun test",
     "refunds:demo:cloud": "cd examples/refunds && ALCHEMY_LOG_LEVEL=error bun test"
   },
