@@ -131,7 +131,7 @@ export const layer = (options: ApiClient.ConnectOptions) =>
         ...r,
         respond: (response, opts) =>
           Effect.map(
-            call(api.requests.respond({ params: { id: r.id }, payload: { response, by: opts?.by ?? "platform-client", revision: r.artifact?.revision } })),
+            call(api.requests.respond({ params: { id: r.id }, payload: { response, by: opts?.by ?? "platform-client", ...(r.artifact ? { revision: r.artifact.revision } : {}) } })),
             request,
           ),
       });

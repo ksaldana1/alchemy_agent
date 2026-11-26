@@ -498,6 +498,9 @@ test("greets", Effect.gen(function* () {
 
   Inside handlers and tools, `Testing.crashExecution` crashes on the spot, and
   `Testing.count(name)` is a durable counter for asserting how many times something really ran.
+  Together they can plant a crash at the worst moment: the refund desk's demo wraps its payment
+  gateway so the first refund goes through and the agent dies before recording it
+  ([`test/platform.ts`](../examples/refunds/test/platform.ts)).
 
 ---
 
@@ -507,7 +510,11 @@ test("greets", Effect.gen(function* () {
   whenever its task resumes: after an agent call or `Agent.generate` it waited on, or after a
   person's answer. Recorded calls reuse their results, but handler code and external side effects
   can repeat. For outside side effects, use the task id (or `Agent.ToolCall`'s `idempotencyKey`)
-  as the idempotency key.
+  as the idempotency key. The [refund desk](../examples/refunds) does this with a payment gateway:
+
+  ```ts
+  IssueRefund: ({ payload, taskId }) => gateway.refund({ idempotencyKey: taskId, ...payload }),
+  ```
 - **Make the same calls in the same order.** Calls inside a handler, a tool, or a workflow are
   identified by their position. A run that makes a different call at the same position stops
   with an error instead of getting another call's answer. Don't branch on time or randomness
@@ -532,6 +539,7 @@ test("greets", Effect.gen(function* () {
 |---|---|
 | [`examples/hello`](../examples/hello) | Agents, retries, keyed tasks, agents waiting on agents |
 | [`examples/support-desk`](../examples/support-desk) | LLM agents on Workers AI, tools that call other agents, the workspace |
+| [`examples/refunds`](../examples/refunds) | Exactly-once side effects: an LLM agent, a manager's approval, a payment gateway and email with idempotency keys, and a narrated demo that crashes the agent at the worst moment (`bun run refunds:demo`) |
 | [`examples/newsroom`](../examples/newsroom) | Everything together: listener → workflow → LLM editor and reviewers → human sign-off → publish, plus an acceptance test under chaos |
 
 The newsroom's [`test/newsroom.test.ts`](../examples/newsroom/test/newsroom.test.ts) and
