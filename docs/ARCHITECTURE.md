@@ -98,6 +98,37 @@ capabilities is planned later (see PLAN.md, "Later").
 - Chat UI and client state sync.
 - Running on providers other than Cloudflare.
 
+## The inbox (implemented in M1)
+
+**Storage.** Each agent is one Durable Object instance, and its inbox is the SQLite table
+`alchemy_agent_inbox` inside it. A row holds `task_id` (unique), `task`, the encoded `input`,
+`status`, `attempts`, `max_attempts`, `run_at`, `result`, `error`, `causation`, and timestamps.
+`alchemy_agent_meta` holds the drain cursor, and `alchemy_agent_schema` holds the schema version.
+Alchemy's own job table holds the one pending `drain` callback.
+
+**Creating a task.** `enqueue` runs in one `storage.transaction`. It decodes the input
+(an unknown task or invalid input is stored as `failed` right away), inserts the row (an existing
+task id is left untouched), and schedules the `drain` callback for now. A write and the scheduling
+of its follow-up commit together.
+
+**The drain loop.** A durable callback, single-flight per Durable Object:
+1. Any row still `running` belongs to an execution that ended without settling it. It counts as a
+   lost attempt (`ExecutionLost`): back to `pending` with a backoff, or `failed` at the cap.
+2. Up to 10 due rows, FIFO. For each: mark `running` and increment `attempts` (committed
+   before the handler runs), run the handler, then commit one of: `completed` with the result,
+   `failed` (a `PermanentError`, an unknown task, invalid input, or the attempt cap), or `pending`
+   with `run_at = now + delay × 2^(attempts−1)`.
+3. If any row is still pending, reschedule the drain at the earliest `run_at`, passing an
+   increasing cursor as `progress`. Without it, Alchemy counts each reschedule as a retry.
+
+The drain never fails because of agent code. Handler failures are recorded in the row, so the
+inbox, not Alchemy, decides about retries, and every task settles. Alchemy retries the drain
+callback itself only when the execution dies (for example, the CPU limit), and step 1 recovers.
+
+**Callers.** `Agent.lookup(Agent)` in a Worker, `Agent.use(Agent)` in a handler (with `uses`),
+and `Api.client(...)` over HTTP all return the same `AgentClient`, typed from the agent
+definition. `send` returns a `TaskHandle`, whose `result()` polls the record until it settles.
+
 ## To be added after M0
 
 - Components and responsibilities, and how they map onto Cloudflare and Alchemy resources.

@@ -16,6 +16,18 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
 - In Effect 4.1, the modules are `effect/ai`, `effect/http`, and `effect/workflow`. Older docs and examples use `effect/unstable/*`.
 - Run the Alchemy CLI from the repo root with `bun run alchemy …` (or `bun run dev|deploy|plan|destroy`). These run it inside `spikes/` under Bun. A bare `bunx alchemy` at the root fetches a temporary copy that can't load `@effect/platform-bun`.
 - Bun uses its isolated linker here, so each workspace package declares every dependency it imports.
+- Commands. Library tests: `bun run test` (local workerd) and `bun run test:cloud` (deploys
+  `test_$USER`, then destroys it). Spike suites: `bun run test:spikes[:cloud]`. The Hello
+  example: `bun run hello:dev|deploy|plan|destroy|check`. It needs `AGENT_API_TOKEN` in
+  `examples/hello/.env`, which is gitignored.
+- `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
+  replaces the live Worker with a local one.
+- A class-style `Context.Service` has no `.asEffect()`. Use `yield* Service` or
+  `Effect.service(Service)`.
+- TypeScript 7 can hide later errors in a file while earlier ones are present. Check each
+  `@ts-expect-error` case on its own.
+- Deployed Workers freeze `Date.now()` and `performance.now()` during synchronous code. Never
+  write a busy loop or a timeout that depends on the clock.
 
 ## Project docs
 

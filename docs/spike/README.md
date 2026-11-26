@@ -25,6 +25,10 @@ has its own doc here. **When all of them are done, stop and revisit D1–D9.**
 0.4 comes after 0.3 because both workflow engines need a DO that signals the workflow when its
 work finishes, and that DO uses the callback pattern from 0.3.
 
+**Changed 2026-11-25:** after 0.1–0.3, M1 started without waiting for the rest. 0.5 now runs
+before M2 and 0.4 before M5, against the real inbox instead of probe DOs. See PLAN.md, M0
+status.
+
 ## Conventions for every spike
 
 - **Spike code is throwaway.** It lives in `spikes/`, not in `packages/agent/`. There is one

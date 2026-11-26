@@ -1,4 +1,4 @@
 {
   "files": [],
-  "references": [{ "path": "packages/agent" }, { "path": "spikes" }]
+  "references": [{ "path": "packages/agent" }, { "path": "examples/hello" }, { "path": "spikes" }]
 }

@@ -4,17 +4,26 @@
   "type": "module",
   "workspaces": [
     "packages/*",
+    "examples/*",
     "spikes"
   ],
   "scripts": {
     "typecheck": "tsc -b",
-    "test": "cd spikes && ALCHEMY_TEST_DEV=1 bun test",
-    "test:cloud": "cd spikes && bun test",
+    "test": "cd packages/agent && ALCHEMY_TEST_DEV=1 bun test",
+    "test:cloud": "cd packages/agent && bun test",
+    "test:spikes": "cd spikes && ALCHEMY_TEST_DEV=1 bun test",
+    "test:spikes:cloud": "cd spikes && bun test",
     "alchemy": "bun --cwd spikes --bun alchemy",
     "dev": "bun --cwd spikes --bun alchemy dev --stage local_$USER",
     "deploy": "bun --cwd spikes --bun alchemy deploy",
     "plan": "bun --cwd spikes --bun alchemy plan",
-    "destroy": "bun --cwd spikes --bun alchemy destroy"
+    "destroy": "bun --cwd spikes --bun alchemy destroy",
+    "hello:alchemy": "bun --cwd examples/hello --bun alchemy",
+    "hello:dev": "bun --cwd examples/hello --bun alchemy dev --stage local_$USER",
+    "hello:deploy": "bun --cwd examples/hello --bun alchemy deploy",
+    "hello:plan": "bun --cwd examples/hello --bun alchemy plan",
+    "hello:destroy": "bun --cwd examples/hello --bun alchemy destroy",
+    "hello:check": "bun --cwd examples/hello scripts/check.ts"
   },
   "devDependencies": {
     "@alchemy.run/test": "2.0.0-beta.87",

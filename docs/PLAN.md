@@ -60,6 +60,11 @@ examples/support-desk/   # LLM demo (port of mini-agent-runtime/examples/support
 
 ## M0: Foundation and spikes (stop and review after this milestone)
 
+> **Status (2026-11-25):** 0.1–0.3 are done (findings in `docs/spike/`). By decision on
+> 2026-11-25, M1 started without 0.4 and 0.5: 0.5 runs before M2 and 0.4 before M5, since only
+> those milestones depend on them. D1–D4 are confirmed by 0.2/0.3; D5, D6 and D9 stay proposed
+> until their spikes run.
+
 **0.1 Scaffold.** Bun workspace. Pin exact versions of `alchemy`, `@alchemy.run/cloudflare`, `effect`,
 and `@alchemy.run/test`. Set up `alchemy profile edit --add Cloudflare`. The `examples/hello`
 stack has one Worker and a `Counter` DO.
@@ -110,6 +115,29 @@ anything (likely not, since it conflicts with Alchemy DO classes).
 - a task that throws once succeeds on attempt 2
 - a duplicate `taskId` is a no-op
 - redeploying while a task is pending still completes it
+
+**Status (2026-11-25): done.** Library in `packages/agent/` (`Agent.ts`, `Api.ts`,
+`internal/inbox.ts`); playground stack in `examples/hello/` (stack `Hello`, deployed on
+`dev_$USER`). Tests: `packages/agent/test/inbox.test.ts` (15 scenarios, local and on
+`test_$USER`) and `test/types/agent.test-d.ts`. The deployed check is
+`bun run hello:check <url> all|redeploy-start|redeploy-finish`, and all four checks pass.
+
+Changes from the plan above, and why:
+- **No `Cloudflare.SqlMigrations`.** It only reads a directory "relative to where Alchemy runs",
+  so a library can't ship its own. The inbox applies an inline, versioned schema on activation
+  (`alchemy_agent_schema`), the same approach Alchemy uses for its own alarm tables.
+- **`send(task, input, { taskId? })`.** The task id is optional and defaults to a random UUID.
+  Agent-to-agent sends inside a handler should pass a derived id (`${ctx.taskId}:…`) so a rerun
+  produces the same id; M3 makes that the default.
+- **The "logger" in `AgentContext`** is Effect's own logger, annotated with agent, task id and
+  attempt. There's no separate service.
+- **`handle.result()` polls** the stored record with backoff (100 ms → 2 s) and never gives up
+  on its own; callers add `Effect.timeout`. Waiting without polling belongs to M3.
+- **Defaults chosen for the 0.2 open questions:** `RuntimeContext` never appears in user-visible
+  types. Outputs without an `output` schema must be plain JSON (a compile error otherwise).
+  `result()` hangs off the typed `TaskHandle`.
+- **Every task carries a `causation`** (`<Type>/<name>/<taskId>` of the sending task, or null
+  from the API). This is a start on the observability invariant.
 
 ## M2: LLM agents (first-class)
 
