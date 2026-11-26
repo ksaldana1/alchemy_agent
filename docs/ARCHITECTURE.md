@@ -4,6 +4,7 @@
 > the mapping onto Cloudflare resources get added after the M0 spikes confirm decisions D1–D9 in
 > [PLAN.md](PLAN.md). Until then, the "Guiding decisions" table in PLAN.md is the working design.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
+> The end goal, as code, is in [NORTH-STAR.md](NORTH-STAR.md).
 
 ## Purpose
 

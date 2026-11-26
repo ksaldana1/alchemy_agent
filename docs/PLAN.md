@@ -24,6 +24,10 @@ stage (`alchemy deploy --stage dev_$USER`) and see working. Most tests run local
 (`Test.make({ dev: true })` on workerd). Each milestone also adds one integration test that deploys
 to the cloud.
 
+**End goal:** [NORTH-STAR.md](NORTH-STAR.md) shows the newsroom as it should read once M8 is
+done. Each milestone's API should move toward it. Diverge only on purpose, and update that doc
+when you do.
+
 ## Guiding decisions (proposed; revisit after M0)
 
 | # | Decision | Choice |
@@ -207,6 +211,7 @@ same event is replayed by hand into the queue. A poison message lands in the DLQ
 - an approval of a stale revision is rejected
 
 ## M8: Acceptance demo
+The target code for this demo is in [NORTH-STAR.md](NORTH-STAR.md).
 
 The newsroom on Cloudflare, with LLM editor and reviewers:
 1. A file uploaded to R2 under `incoming/` triggers a listener.

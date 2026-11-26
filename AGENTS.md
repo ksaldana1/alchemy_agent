@@ -31,6 +31,8 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
 
 ## Project docs
 
+- `docs/NORTH-STAR.md`: the end goal, the newsroom as it should read once M8 is done. Check API
+  decisions against it.
 - `docs/PLAN.md`: milestones and design decisions D1–D9.
 - `docs/GLOSSARY.md`: the project's terms. Use them in code, docs, and conversation.
 - `docs/ARCHITECTURE.md`: principles and invariants that every change must keep.
