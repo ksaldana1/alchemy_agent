@@ -56,6 +56,12 @@ const keyedTaskId = (tag: string, payload: unknown) =>
 
 const isSettled = (r: TaskRecord) => r.status === "completed" || r.status === "failed";
 
+/** A record `enqueue` made up to refuse a send (not stored): the task id was taken by something else. */
+export const isRefused = (r: TaskRecord) => {
+  const error = r.error as StoredFailure | undefined;
+  return error?.kind === "agent" && Predicate.hasProperty(error.reason, "_tag") && error.reason._tag === "InputConflict";
+};
+
 /** The outcome of a settled record: the decoded success, the declared error, or an AgentError. */
 export const outcome = Effect.fnUntraced(function* (agent: Address, rpc: Rpc.AnyWithProps, record: TaskRecord) {
   if (record.status === "completed") {
@@ -128,7 +134,10 @@ export const makeClient = <Rpcs extends Rpc.Any>(contract: AgentContract, agent:
         return settled === undefined ? undefined : yield* outcome(agent, rpc, settled);
       }
       const recorded = yield* transport.enqueue(keyedTaskId(tag, payload) ?? crypto.randomUUID(), tag, encoded);
+      // A refused send (`InputConflict`) comes back settled, even with `discard`: nothing was recorded.
+      if (isSettled(recorded) && isRefused(recorded)) return yield* outcome(agent, rpc, recorded);
       if (!wait) return undefined;
+      if (isSettled(recorded)) return yield* outcome(agent, rpc, recorded);
       return yield* outcome(agent, rpc, yield* awaitSettled(transport, agent, recorded.taskId));
     });
   }
@@ -170,6 +179,15 @@ export type AgentRpc = {
     taskId: string,
     outcome: { readonly status: "completed"; readonly result: unknown } | { readonly status: "failed"; readonly error: StoredFailure },
   ) => Effect.Effect<{ readonly resolved: boolean; readonly record: TaskRecord | null }, never, any>;
+  /**
+   * Cancels a task that hasn't settled: it settles as failed with `Canceled { reason }`, its turns
+   * end, its calls not yet delivered are dropped, and waiting callers are told. A handler running
+   * at the time is interrupted and its outcome discarded. A settled task is left alone.
+   */
+  cancel: (
+    taskId: string,
+    options: { readonly reason: string },
+  ) => Effect.Effect<{ readonly canceled: boolean; readonly record: TaskRecord | null }, never, any>;
   /** M7: the inbox, in arrival order (inspection). */
   tasks: (query: {
     readonly statuses?: ReadonlyArray<string>;
@@ -239,6 +257,7 @@ export const bindingTransport = (address: Address): Transport => {
     enqueue: (taskId, tag, payload) =>
       Effect.flatMap(causation, (c) => reliably(address, (stub) => stub.enqueue(taskId, tag, payload, { causation: c }))),
     get: (taskId) => reliably(address, (stub) => stub.get(taskId)),
+    cancel: (taskId, reason) => reliably(address, (stub) => stub.cancel(taskId, { reason })),
     // If `wait` fails (right after a deploy an instance can still run older code), fall back to
     // reading the record after a pause: waiting is never worse than polling.
     wait: (taskId) =>

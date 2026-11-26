@@ -167,3 +167,15 @@ export const ClerkLive = Clerk.toLayer(
     }),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Retention: settled tasks are pruned after a second
+// ---------------------------------------------------------------------------
+
+export const Note = Rpc.make("Note", {
+  payload: { id: Schema.String },
+  success: Schema.Struct({ id: Schema.String }),
+  primaryKey: ({ id }) => id,
+});
+export const Brief = Agent.make("Brief", [Note]);
+export const BriefLive = Brief.toLayer(Brief.of({ Note: ({ payload }) => Effect.succeed({ id: payload.id }) }), { retention: "1 second" });

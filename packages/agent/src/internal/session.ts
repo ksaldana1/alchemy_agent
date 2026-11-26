@@ -217,14 +217,16 @@ export const makeSessions = (deps: SessionDeps) => {
     const events = yield* transaction(
       Effect.gen(function* () {
         const status = outcome.error ? "failed" : "completed";
-        yield* sql.exec(
-          "UPDATE alchemy_agent_turns SET status = ?, output = ?, error = ?, settled_at = ? WHERE id = ? AND status = 'running'",
+        const updated = yield* all<{ id: string }>(
+          "UPDATE alchemy_agent_turns SET status = ?, output = ?, error = ?, settled_at = ? WHERE id = ? AND status = 'running' RETURNING id",
           status,
           outcome.error ? null : JSON.stringify(outcome.output ?? null),
           outcome.error ? Schema.encodeSync(ReasonJson)(outcome.error) : null,
           now(),
           turn.id,
         );
+        // Canceled (with its task) while this step ran: it already settled.
+        if (updated.length === 0) return [] as Array<SessionEvent>;
         yield* deps.onSettled(turn.task_id);
         const started = yield* startNext(turn.session_id);
         return [{ type: "turn", turnId: turn.id, status, ...(outcome.error ? { error: outcome.error } : {}) } as SessionEvent, ...started];
@@ -249,6 +251,10 @@ export const makeSessions = (deps: SessionDeps) => {
   ) {
     const event = yield* transaction(
       Effect.gen(function* () {
+        // The turn may have been canceled (with its task) while this step ran: drop the step, and
+        // the calls its tool made.
+        const current = yield* getTurn(turn.id);
+        if (current?.status !== "running") return undefined;
         yield* alongside;
         const e = yield* append(turn, kind, message);
         yield* sql.exec(
@@ -261,7 +267,7 @@ export const makeSessions = (deps: SessionDeps) => {
         return e;
       }),
     );
-    yield* emit(turn.session_id, event);
+    if (event !== undefined) yield* emit(turn.session_id, event);
   });
 
   const toolResult = (call: Prompt.ToolCallPart, isFailure: boolean, result: unknown) =>
@@ -365,12 +371,19 @@ export const makeSessions = (deps: SessionDeps) => {
       if (result === "suspended") {
         // The tool waits for another agent: the turn holds no execution until the answer
         // arrives, then this step runs again and the tool gets the recorded answer.
-        yield* transaction(
+        const waiting = yield* transaction(
           Effect.gen(function* () {
+            const updated = yield* all<{ id: string }>(
+              "UPDATE alchemy_agent_turns SET status = 'waiting' WHERE id = ? AND status = 'running' RETURNING id",
+              turn.id,
+            );
+            // Canceled while the tool ran: its calls are never sent.
+            if (updated.length === 0) return false;
             yield* calls.flush;
-            yield* sql.exec("UPDATE alchemy_agent_turns SET status = 'waiting' WHERE id = ? AND status = 'running'", turn.id);
+            return true;
           }),
         );
+        if (!waiting) return;
         return yield* emit(turn.session_id, { type: "turn", turnId: turn.id, status: "waiting" });
       }
       return yield* persistStep(turn, "tool_result", toolResult(call, result.isFailure, result.result), undefined, calls.flush);
@@ -468,5 +481,43 @@ export const makeSessions = (deps: SessionDeps) => {
     if (turn !== undefined) yield* schedule(turn);
   });
 
-  return { createTurn, step, outcome, messages, events, emit, resume };
+  /**
+   * In the transaction that cancels a task: fails its unsettled turns, so no further step runs
+   * (a step already running drops its result), and starts the next turn of each session they
+   * held. Returns the events to emit after the transaction commits.
+   */
+  const cancelTask = Effect.fnUntraced(function* (taskId: string, reason: string) {
+    const canceled = yield* all<{ id: string; session_id: string }>(
+      `UPDATE alchemy_agent_turns SET status = 'failed', error = ?, settled_at = ?
+       WHERE task_id = ? AND status IN ('queued', 'running', 'waiting') RETURNING id, session_id`,
+      Schema.encodeSync(ReasonJson)(new ModelError({ message: `the task was canceled: ${reason}` })),
+      now(),
+      taskId,
+    );
+    const events: Array<{ readonly sessionId: string; readonly event: SessionEvent }> = [];
+    for (const t of canceled) events.push({ sessionId: t.session_id, event: { type: "turn", turnId: t.id, status: "failed" } });
+    for (const sessionId of new Set(canceled.map((t) => t.session_id))) {
+      const started = yield* startNext(sessionId);
+      for (const event of started) events.push({ sessionId, event });
+      if (started.length === 0) events.push({ sessionId, event: { type: "idle" } });
+    }
+    return events;
+  });
+
+  /**
+   * Retention: removes a pruned task's turns, and the transcripts of the sessions they had to
+   * themselves (a turn without `session` is its own session). A named session is a conversation
+   * other tasks continue, so its transcript stays.
+   */
+  const removeTask = Effect.fnUntraced(function* (taskId: string) {
+    const turns = yield* all<{ id: string; session_id: string }>(
+      "DELETE FROM alchemy_agent_turns WHERE task_id = ? AND status IN ('completed', 'failed') RETURNING id, session_id",
+      taskId,
+    );
+    for (const t of turns) {
+      if (t.session_id === t.id) yield* sql.exec("DELETE FROM alchemy_agent_transcript WHERE session_id = ?", t.session_id);
+    }
+  });
+
+  return { createTurn, step, outcome, messages, events, emit, resume, cancelTask, removeTask };
 };

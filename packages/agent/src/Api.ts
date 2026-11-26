@@ -1,7 +1,10 @@
 // The agents' HTTP API, and how to reach agents over it.
 //
-//   POST {prefix}/:type/:name/tasks               { tag, payload, taskId? } → 202 TaskRecord
+//   POST {prefix}/:type/:name/tasks               { tag, payload, taskId? } → 202 TaskRecord; 409 a failed
+//        TaskRecord (InputConflict, not stored) when taskId is already recorded with another task or payload
 //   GET  {prefix}/:type/:name/tasks/:taskId       [?wait=1]                → TaskRecord | 404
+//   POST {prefix}/:type/:name/tasks/:taskId/cancel { reason? }             → 200 the canceled TaskRecord;
+//        409 { error, record } already settled; 404
 //   GET  {prefix}/:type/:name/sessions/:id        [?after=<seq>]           → transcript
 //   GET  {prefix}/:type/:name/sessions/:id/events [?after=<seq>]           → SSE: the transcript, then
 //        new messages and turn changes until the session is idle; reconnect with ?after=<last seq>
@@ -46,7 +49,7 @@ import * as Redacted from "effect/Redacted";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { bindingTransport, stubFor, type AgentRpc } from "./internal/client.ts";
+import { bindingTransport, isRefused, stubFor, type AgentRpc } from "./internal/client.ts";
 import { AgentError, Agents, Unreachable, type Address, type Transport } from "./internal/core.ts";
 import { TaskRecord } from "./internal/inbox.ts";
 import type { SessionEvent } from "./internal/session.ts";
@@ -173,7 +176,7 @@ export const routes = (agents?: ReadonlyArray<{ readonly type: string }>, option
         });
       }
 
-      const task = rest.match(/^\/([^/]+)\/([^/]+)\/tasks(?:\/([^/]+))?$/);
+      const task = rest.match(/^\/([^/]+)\/([^/]+)\/tasks(?:\/([^/]+)(\/cancel)?)?$/);
       if (!task) return yield* json({ error: "not found" }, 404);
       const address: Address = {
         type: decodeURIComponent(task[1]!),
@@ -187,14 +190,22 @@ export const routes = (agents?: ReadonlyArray<{ readonly type: string }>, option
         const body = yield* HttpServerRequest.schemaBodyJson(EnqueueBody).pipe(Effect.option);
         if (body._tag === "None") return yield* json({ error: "body must be { tag, payload?, taskId? }" }, 400);
         const { tag, payload, taskId = crypto.randomUUID() } = body.value;
-        return yield* json(yield* transport.enqueue(taskId, tag, payload ?? null), 202);
+        const recorded = yield* transport.enqueue(taskId, tag, payload ?? null);
+        return yield* json(recorded, isRefused(recorded) ? 409 : 202);
+      }
+      if (task[3] !== undefined && task[4] !== undefined && request.method === "POST") {
+        const body = (yield* request.json.pipe(Effect.option)).pipe(Option.getOrUndefined) as { reason?: unknown } | undefined;
+        const reason = typeof body?.reason === "string" ? body.reason : "";
+        const { canceled, record } = yield* transport.cancel(decodeURIComponent(task[3]), reason);
+        if (record === null) return yield* json({ error: "not found" }, 404);
+        return yield* canceled ? json(record) : json({ error: "already settled", record }, 409);
       }
       if (task[3] === undefined && request.method === "GET") {
         const stub = yield* stubFor(address);
         const statuses = url.searchParams.get("status")?.split(",").filter((x) => x !== "");
         return yield* json(yield* stub.tasks({ ...(statuses ? { statuses } : {}), after, limit: Number(url.searchParams.get("limit") ?? 100) || 100 }));
       }
-      if (task[3] !== undefined && request.method === "GET") {
+      if (task[3] !== undefined && task[4] === undefined && request.method === "GET") {
         const taskId = decodeURIComponent(task[3]);
         const record = yield* url.searchParams.has("wait") ? transport.wait(taskId) : transport.get(taskId);
         return yield* record === null ? json({ error: "not found" }, 404) : json(record);
@@ -442,16 +453,21 @@ export const connect = (options: {
 
       const transport = (agent: Address): Transport => {
         const tasks = `${base}/agents/${encodeURIComponent(agent.type)}/${encodeURIComponent(agent.name)}/tasks`;
-        const send = (request: HttpClientRequest.HttpClientRequest): Effect.Effect<TaskRecord | null, AgentError> =>
+        /**
+         * One request. `found`: the API's own 404 means "no such task" (null). `accept`: statuses
+         * other than 2xx whose body is an answer, not a failure.
+         */
+        const exchange = (request: HttpClientRequest.HttpClientRequest, options: { readonly found?: boolean; readonly accept?: ReadonlyArray<number> } = {}) =>
           Effect.gen(function* () {
             const res = yield* http.execute(request);
             // Only the API's own "not found" means the task doesn't exist. A 404 from the edge
             // (a fresh workers.dev URL still converging) is retried.
-            if (res.status === 404 && request.method === "GET") {
+            if (res.status === 404 && options.found) {
               yield* HttpClientResponse.schemaBodyJson(ApiNotFound)(res).pipe(Effect.mapError(() => new EdgeNotReady()));
               return null;
             }
-            return yield* HttpClientResponse.filterStatusOk(res).pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(TaskRecord)));
+            const ok = options.accept?.includes(res.status) ? res : yield* HttpClientResponse.filterStatusOk(res);
+            return { status: ok.status, body: yield* ok.json };
           }).pipe(
             Effect.retry({
               while: (e) => e._tag === "EdgeNotReady",
@@ -468,13 +484,35 @@ export const connect = (options: {
                 }),
             ),
           );
+        const decodeRecord = (body: unknown) =>
+          Schema.decodeUnknownEffect(TaskRecord)(body).pipe(
+            Effect.mapError((e) => new AgentError({ agent, reason: new Unreachable({ message: `unexpected answer: ${e.message}` }) })),
+          );
+        const get = (url: string) =>
+          Effect.flatMap(exchange(HttpClientRequest.get(url), { found: true }), (r) => (r === null ? Effect.succeed(null) : decodeRecord(r.body)));
         return {
+          // A 409 is a refused send (InputConflict): its body is the failed record.
           enqueue: (taskId, tag, payload) =>
-            send(
-              HttpClientRequest.post(tasks).pipe(HttpClientRequest.setBody(HttpBody.jsonUnsafe({ taskId, tag, payload }))),
-            ) as Effect.Effect<TaskRecord, AgentError>,
-          get: (taskId) => send(HttpClientRequest.get(`${tasks}/${encodeURIComponent(taskId)}`)),
-          wait: (taskId) => send(HttpClientRequest.get(`${tasks}/${encodeURIComponent(taskId)}?wait=1`)),
+            exchange(HttpClientRequest.post(tasks).pipe(HttpClientRequest.setBody(HttpBody.jsonUnsafe({ taskId, tag, payload }))), {
+              accept: [409],
+            }).pipe(Effect.flatMap((r) => decodeRecord(r!.body))),
+          get: (taskId) => get(`${tasks}/${encodeURIComponent(taskId)}`),
+          wait: (taskId) => get(`${tasks}/${encodeURIComponent(taskId)}?wait=1`),
+          // 200: canceled now (the record); 409: already settled ({ error, record }); 404: no such task.
+          cancel: (taskId, reason) =>
+            exchange(
+              HttpClientRequest.post(`${tasks}/${encodeURIComponent(taskId)}/cancel`).pipe(HttpClientRequest.setBody(HttpBody.jsonUnsafe({ reason }))),
+              { found: true, accept: [409] },
+            ).pipe(
+              Effect.flatMap((r): Effect.Effect<{ readonly canceled: boolean; readonly record: TaskRecord | null }, AgentError> =>
+                r === null
+                  ? Effect.succeed({ canceled: false, record: null })
+                  : Effect.map(decodeRecord(r.status === 409 ? (r.body as { record?: unknown }).record : r.body), (record) => ({
+                      canceled: r.status !== 409,
+                      record,
+                    })),
+              ),
+            ),
         };
       };
       return { transport };

@@ -54,12 +54,16 @@ That repo's tests describe behavior worth keeping. Its code is not ported.
 These must hold in every implementation. Each one should have a test.
 
 **Delivery**
-- A task is recorded at most once per task id. Creating it again has no effect.
+- A task is recorded at most once per task id. Creating it again with the same task and payload
+  has no effect; with a different one it is refused (`InputConflict`) and nothing is recorded.
+  With a retention, this holds until the settled task is pruned.
 - Delivery is at least once. A task's effects inside the platform take effect once. Effects
   outside the platform may repeat, and agent code uses the task id as the idempotency key for them.
 - A settled task never runs again, and its outcome never changes.
-- Every task eventually settles: completed, failed permanently, or failed after its attempt cap.
-  Nothing retries forever.
+- Every task eventually settles: completed, failed permanently, failed after its attempt cap, or
+  canceled. Nothing retries forever.
+- A canceled task records nothing more: the outcome of a handler or turn step still running when
+  it was canceled is discarded, with the calls it made.
 
 **Atomicity**
 - A state change and the scheduling of its follow-up work commit together, or neither does.
@@ -119,7 +123,8 @@ tools have to be known whenever the Durable Object wakes.
 reach the caller as themselves, so `catchTag` works across agents. Everything else the platform
 reports is one `AgentError { agent, reason }`, where the reason is a tagged union: `Unreachable`,
 `ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`,
-`FsDenied` (an undeclared workspace denial, never retried). (Records
+`FsDenied` (an undeclared workspace denial, never retried), `InputConflict` (the task id is taken
+by another task or payload), `Canceled`. (Records
 from before M3 can also carry `WaitingInHandler`, which nothing produces any more.) An undeclared
 failure is retried up to the attempt cap.
 
@@ -169,6 +174,30 @@ commits, and returns after 20 s at most. Callers loop, so an eviction only costs
 previous code for a few minutes. Callers must tolerate an instance that is one version behind:
 add RPC methods without removing old ones, and have callers fall back when a new method is
 missing. (`wait` falls back to reading the record.)
+
+## Conflicts, cancellation, and retention (after M8, 2026-11-26)
+
+Taken from the Cloudflare Agents SDK's Tasks (`TaskInputConflictError`, `cancel`, `retain`).
+
+**Conflicts.** `enqueue` compares an existing task's tag and stored input with the new one (JSON
+with sorted keys). If they differ, it returns a failed record of its own, not stored, with
+`InputConflict`. Callers treat an `enqueue` record that has already settled as the answer: the
+client returns it (with `discard` too, for a refusal), the outbox settles the call without
+subscribing, and a workflow's send step records it. Over HTTP it's a `409`.
+
+**Cancellation.** The `cancel` RPC runs one transaction: the task becomes `failed` with
+`Canceled { reason }` from any unsettled status, its unsettled turns fail, its undelivered calls
+(outbox rows whose id starts with `<taskId>#`) are marked `failed`, and its subscribers get the
+reply. Then the handler fiber, if this execution is running it, is interrupted. Each write that
+records an outcome checks first that its row is still `running` (the drain's outcome commit, a
+turn step's `persistStep`, `settle`, and a tool's suspension), so a cancel racing an execution
+wins and the execution's calls are never sent. Tasks already delivered to other agents aren't
+canceled.
+
+**Retention.** `toLayer(…, { retention })`. At the end of each drain pass, up to 50 tasks settled
+before `now − retention` are removed with their turns, their calls, and the transcripts of
+sessions they had to themselves (a named session's transcript stays). Delivered replies older than
+the cutoff go too. A removed task id can be recorded again as a new task.
 
 ## Messages between agents (implemented in M3)
 

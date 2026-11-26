@@ -159,6 +159,8 @@ const MIGRATIONS: ReadonlyArray<string> = [
      reply_id   TEXT NOT NULL,
      PRIMARY KEY (task_id, reply_type, reply_name, reply_id)
    );`,
+  // Retention: settled tasks are pruned oldest first.
+  `CREATE INDEX alchemy_agent_inbox_settled ON alchemy_agent_inbox (settled_at) WHERE settled_at IS NOT NULL;`,
 ];
 
 export const migrate = Effect.fnUntraced(function* (
@@ -229,6 +231,26 @@ export interface NewTask {
   /** Set when the task is settled on arrival (unknown task, invalid input). */
   readonly failure?: StoredFailure;
 }
+
+/** JSON with object keys sorted, so two payloads compare equal whatever their key order. */
+const canonical = (value: unknown): string =>
+  JSON.stringify(value ?? null, (_, v: unknown) =>
+    v !== null && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : v,
+  );
+
+/**
+ * Why an existing task can't be the one `t` asks for, or undefined if it is the same task. The
+ * task id is an idempotency key: sending it again with another task or payload is a mistake, not
+ * a duplicate.
+ */
+export const conflictWith = (row: Row, t: { readonly task: string; readonly input: unknown }): string | undefined =>
+  row.task !== t.task
+    ? `task id ${row.task_id} is already recorded for ${row.task}, not ${t.task}`
+    : canonical(JSON.parse(row.input)) !== canonical(t.input)
+      ? `task id ${row.task_id} is already recorded with a different payload`
+      : undefined;
 
 /**
  * Records a task. A task id that already exists is left untouched (the task id is the
@@ -393,6 +415,37 @@ export const resolveWaiting = (
         ),
     (c) => c.toArray(),
   ).pipe(Effect.map((rows) => rows.length > 0));
+
+/**
+ * Settles a task that hasn't settled yet as failed with `error` (a cancellation). Works on any
+ * unsettled status: a `running` handler's own outcome is then discarded, because every write
+ * that records an outcome requires `running`. Returns whether this call settled it.
+ */
+export const cancel = (sql: Sql, taskId: string, error: StoredFailure, now: number) =>
+  Effect.flatMap(
+    sql.exec<{ seq: number }>(
+      "UPDATE alchemy_agent_inbox SET status = 'failed', error = ?, settled_at = ? WHERE task_id = ? AND status IN ('pending', 'running', 'waiting') RETURNING seq",
+      JSON.stringify(error),
+      now,
+      taskId,
+    ),
+    (c) => c.toArray(),
+  ).pipe(Effect.map((rows) => rows.length > 0));
+
+/** Up to `limit` tasks that settled before `before`, oldest first (retention). */
+export const settledBefore = (sql: Sql, before: number, limit: number) =>
+  Effect.flatMap(
+    sql.exec<{ task_id: string }>(
+      "SELECT task_id FROM alchemy_agent_inbox WHERE settled_at IS NOT NULL AND settled_at < ? AND status IN ('completed', 'failed') ORDER BY settled_at LIMIT ?",
+      before,
+      limit,
+    ),
+    (c) => c.toArray(),
+  ).pipe(Effect.map((rows) => rows.map((r) => r.task_id)));
+
+/** Removes a settled task's row. Its task id can then be recorded again, as a new task. */
+export const remove = (sql: Sql, taskId: string) =>
+  sql.exec("DELETE FROM alchemy_agent_inbox WHERE task_id = ? AND status IN ('completed', 'failed')", taskId).pipe(Effect.asVoid);
 
 /** Tasks in arrival order, optionally only some statuses (inspection, M7). */
 export const list = (

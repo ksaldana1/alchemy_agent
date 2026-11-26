@@ -62,6 +62,20 @@ export class FsDenied extends Schema.TaggedError<FsDenied>()("FsDenied", {
   message: Schema.String,
 }) {}
 
+/**
+ * The task id is already recorded with a different task or payload. A task id is an idempotency
+ * key: sending it again must send the same thing. Nothing is recorded for this call.
+ */
+export class InputConflict extends Schema.TaggedError<InputConflict>()("InputConflict", {
+  taskId: Schema.String,
+  message: Schema.String,
+}) {}
+
+/** The task was canceled before it settled (`Agent.cancel`, or `POST …/tasks/:taskId/cancel`). */
+export class Canceled extends Schema.TaggedError<Canceled>()("Canceled", {
+  reason: Schema.String,
+}) {}
+
 export const AgentErrorReason = Schema.Union([
   Unreachable,
   ExecutionLost,
@@ -71,6 +85,8 @@ export const AgentErrorReason = Schema.Union([
   GenerationFailed,
   WaitingInHandler,
   FsDenied,
+  InputConflict,
+  Canceled,
 ]);
 
 /**
@@ -123,6 +139,14 @@ export interface Transport {
   readonly get: (taskId: string) => Effect.Effect<TaskRecord | null, AgentError>;
   /** Returns once the task settles, or after a while with its current record (callers loop). */
   readonly wait: (taskId: string) => Effect.Effect<TaskRecord | null, AgentError>;
+  /**
+   * Cancels a task that hasn't settled. Returns its record (settled as `Canceled` if this call
+   * canceled it, else as it was), or null for an unknown task.
+   */
+  readonly cancel: (
+    taskId: string,
+    reason: string,
+  ) => Effect.Effect<{ readonly canceled: boolean; readonly record: TaskRecord | null }, AgentError>;
 }
 
 /**

@@ -13,7 +13,8 @@ import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as Agent from "../src/Agent.ts";
 import * as Api from "../src/Api.ts";
-import { Echo, Flaky, Nope, Relay } from "./fixtures/agents.ts";
+import * as Fiber from "effect/Fiber";
+import { Brief, Clerk, Echo, Flaky, Nope, Relay } from "./fixtures/agents.ts";
 import Stack from "./fixtures/stack.ts";
 
 process.env[Api.TOKEN_ENV] ??= "test-token";
@@ -95,11 +96,51 @@ test(
       const a = echoes(`dedupe-a-${run}`);
       expect(yield* a.EchoKeyed({ id: "k", text: "one" })).toEqual({ echoed: "ONE" });
       // A settled task never runs again, and its outcome never changes.
-      expect(yield* a.EchoKeyed({ id: "k", text: "two" })).toEqual({ echoed: "ONE" });
+      expect(yield* a.EchoKeyed({ id: "k", text: "one" })).toEqual({ echoed: "ONE" });
       expect((yield* record("Echo", `dedupe-a-${run}`, "EchoKeyed:k")).attempts).toBe(1);
       expect(yield* echoes(`dedupe-b-${run}`).EchoKeyed({ id: "k", text: "three" })).toEqual({ echoed: "THREE" });
     }),
   ),
+  timeout,
+);
+
+test(
+  "the same key with a different payload fails with AgentError(InputConflict) and changes nothing",
+  viaApi(
+    Effect.gen(function* () {
+      const a = (yield* Echo.client)(`conflict-${run}`);
+      expect(yield* a.EchoKeyed({ id: "k", text: "one" })).toEqual({ echoed: "ONE" });
+      const error = yield* Effect.flip(a.EchoKeyed({ id: "k", text: "two" }));
+      expect(error).toBeInstanceOf(Agent.AgentError);
+      expect(error.reason).toMatchObject({ _tag: "InputConflict", taskId: "EchoKeyed:k" });
+      // A send without waiting is refused the same way: nothing was recorded.
+      const discarded = yield* Effect.flip(a.EchoKeyed({ id: "k", text: "two" }, { discard: true }));
+      expect(discarded.reason._tag).toBe("InputConflict");
+      expect(yield* record("Echo", `conflict-${run}`, "EchoKeyed:k")).toMatchObject({ status: "completed", attempts: 1, result: { echoed: "ONE" } });
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "over HTTP, a conflicting send is a 409; the same payload in another key order is the same task",
+  Effect.gen(function* () {
+    const { url } = yield* stack;
+    const post = (body: unknown) =>
+      HttpClient.execute(
+        HttpClientRequest.post(`${url}/agents/Echo/order-${run}/tasks`).pipe(
+          HttpClientRequest.bearerToken(token),
+          HttpClientRequest.setBody(HttpBody.jsonUnsafe(body)),
+        ),
+      ).pipe(Effect.flatMap((res) => Effect.map(res.json, (json) => ({ status: res.status, json }))));
+    expect((yield* post({ tag: "EchoKeyed", taskId: "t", payload: { id: "t", text: "a" } })).status).toBe(202);
+    expect((yield* post({ tag: "EchoKeyed", taskId: "t", payload: { text: "a", id: "t" } })).status).toBe(202);
+    expect(yield* post({ tag: "EchoKeyed", taskId: "t", payload: { id: "t", text: "b" } })).toMatchObject({
+      status: 409,
+      json: { status: "failed", error: { kind: "agent", reason: { _tag: "InputConflict" } } },
+    });
+    expect(yield* post({ tag: "EchoText", taskId: "t", payload: { text: "a" } })).toMatchObject({ status: 409 });
+  }),
   timeout,
 );
 
@@ -286,8 +327,9 @@ test(
     Effect.gen(function* () {
       const id = `k-${run}`;
       expect(yield* (yield* Echo.client)("keyed").EchoKeyed({ id, text: "first" })).toEqual({ echoed: "FIRST" });
-      // Same key, same task: the handler gets the settled result, not a new one.
-      expect(yield* (yield* Relay.client)(`keyed-${run}`).AskKeyed({ id, text: "second" })).toBe("FIRST");
+      // Same key, same task: the handler gets the settled result, without running it again.
+      expect(yield* (yield* Relay.client)(`keyed-${run}`).AskKeyed({ id, text: "first" })).toBe("FIRST");
+      expect((yield* record("Echo", "keyed", `EchoKeyed:${id}`)).attempts).toBe(1);
     }),
   ),
   timeout,
@@ -330,5 +372,112 @@ test(
     expect(yield* status("Bearer wrong")).toBe(401);
     expect(yield* status(`Bearer ${token}`)).toBe(404);
   }),
+  timeout,
+);
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/** A task's record once its status is `status`. */
+const recordWhen = (type: string, name: string, taskId: string, status: Agent.TaskStatus) =>
+  record(type, name, taskId).pipe(Effect.repeat({ schedule: Schedule.spaced("100 millis"), until: (r) => r.status === status, times: 200 }));
+
+test(
+  "canceling a running task interrupts its handler and settles it as Canceled; it stays canceled",
+  viaApi(
+    Effect.gen(function* () {
+      const { url } = yield* stack;
+      const name = `cancel-run-${run}`;
+      yield* HttpClient.execute(
+        HttpClientRequest.post(`${url}/agents/Echo/${name}/tasks`).pipe(
+          HttpClientRequest.bearerToken(token),
+          HttpClientRequest.setBody(HttpBody.jsonUnsafe({ tag: "Slow", taskId: "slow", payload: { ms: 4_000 } })),
+        ),
+      );
+      yield* recordWhen("Echo", name, "slow", "running");
+      expect(yield* Agent.cancel(Echo.address(name), "slow", { reason: "no longer needed" })).toBe(true);
+      expect(yield* record("Echo", name, "slow")).toMatchObject({
+        status: "failed",
+        error: { kind: "agent", reason: { _tag: "Canceled", reason: "no longer needed" } },
+      });
+      // A second cancel is a no-op; the handler's own outcome (it would finish by now) is never recorded.
+      expect(yield* Agent.cancel(Echo.address(name), "slow")).toBe(false);
+      yield* Effect.sleep("5 seconds");
+      expect(yield* record("Echo", name, "slow")).toMatchObject({ status: "failed", error: { reason: { _tag: "Canceled" } } });
+      // An unknown task is an error.
+      const missing = yield* Effect.flip(Agent.cancel(Echo.address(name), "nope"));
+      expect(missing.reason._tag).toBe("Unreachable");
+    }),
+  ),
+  { timeout: 90_000 },
+);
+
+test(
+  "canceling a waiting task tells whoever waits for it: they get AgentError(Canceled)",
+  viaApi(
+    Effect.gen(function* () {
+      const name = `cancel-wait-${run}`;
+      const waiting = yield* (yield* Clerk.client)(name).AskBudget({ key: "q", timeoutMs: 60_000 }).pipe(Effect.flip, Effect.forkChild);
+      yield* recordWhen("Clerk", name, "AskBudget:q", "waiting");
+      expect(yield* Agent.cancel(Clerk.address(name), "AskBudget:q", { reason: "budget frozen" })).toBe(true);
+      const error = yield* Fiber.join(waiting);
+      expect(error).toBeInstanceOf(Agent.AgentError);
+      expect((error as Agent.AgentError).reason).toMatchObject({ _tag: "Canceled", reason: "budget frozen" });
+    }),
+  ),
+  { timeout: 90_000 },
+);
+
+test(
+  "over HTTP: cancel is 200 with the record, then 409 once settled, 404 for an unknown task",
+  Effect.gen(function* () {
+    const { url } = yield* stack;
+    const name = `cancel-http-${run}`;
+    const post = (path: string, body: unknown) =>
+      HttpClient.execute(
+        HttpClientRequest.post(`${url}/agents/Echo/${name}/tasks${path}`).pipe(
+          HttpClientRequest.bearerToken(token),
+          HttpClientRequest.setBody(HttpBody.jsonUnsafe(body)),
+        ),
+      ).pipe(Effect.flatMap((res) => Effect.map(res.json, (json) => ({ status: res.status, json }))));
+    yield* post("", { tag: "Slow", taskId: "s", payload: { ms: 4_000 } });
+    expect(yield* post("/s/cancel", { reason: "test" })).toMatchObject({
+      status: 200,
+      json: { status: "failed", error: { reason: { _tag: "Canceled", reason: "test" } } },
+    });
+    expect(yield* post("/s/cancel", {})).toMatchObject({ status: 409, json: { error: "already settled", record: { status: "failed" } } });
+    expect((yield* post("/nope/cancel", {})).status).toBe(404);
+  }),
+  timeout,
+);
+
+// ---------------------------------------------------------------------------
+// Retention
+// ---------------------------------------------------------------------------
+
+test(
+  "with a retention, settled tasks are pruned while the agent works, and their ids are free again",
+  viaApi(
+    Effect.gen(function* () {
+      const { url } = yield* stack;
+      const name = `brief-${run}`;
+      const brief = (yield* Brief.client)(name);
+      expect(yield* brief.Note({ id: "old" })).toEqual({ id: "old" });
+      const first = yield* record("Brief", name, "Note:old");
+      yield* Effect.sleep("1500 millis");
+      // More work: the drain pass that runs it prunes what settled over a second ago.
+      expect(yield* brief.Note({ id: "new" })).toEqual({ id: "new" });
+      const status = (taskId: string) =>
+        HttpClient.execute(HttpClientRequest.get(`${url}/agents/Brief/${name}/tasks/${taskId}`).pipe(HttpClientRequest.bearerToken(token))).pipe(
+          Effect.map((res) => res.status),
+        );
+      expect(yield* status("Note:old")).toBe(404);
+      expect(yield* status("Note:new")).toBe(200);
+      // The pruned id records a new task.
+      expect(yield* brief.Note({ id: "old" })).toEqual({ id: "old" });
+      expect((yield* record("Brief", name, "Note:old")).createdAt).toBeGreaterThan(first.createdAt);
+    }),
+  ),
   timeout,
 );

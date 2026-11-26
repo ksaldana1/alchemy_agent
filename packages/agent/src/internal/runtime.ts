@@ -11,6 +11,7 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
@@ -21,6 +22,7 @@ import {
   AgentContext,
   AgentErrorReason,
   Calls,
+  Canceled,
   ChaosPlan,
   CurrentExecution,
   ExecutionLost,
@@ -29,6 +31,7 @@ import {
   GenerationError,
   GenerationFailed,
   Generating,
+  InputConflict,
   InvalidPayload,
   ModelError,
   Retry,
@@ -54,6 +57,8 @@ const DRAIN_CALLBACK = "alchemy-agent/drain";
 const STEP_CALLBACK = "alchemy-agent/step";
 const OUTBOX_CALLBACK = "alchemy-agent/outbox";
 const WAKE_CALLBACK = "alchemy-agent/wake";
+/** Settled tasks removed per drain pass when the agent has a retention. */
+const PRUNE_BATCH = 50;
 
 export type Handler = (request: {
   readonly payload: unknown;
@@ -82,6 +87,8 @@ export interface HostConfig {
   readonly retry: RetryPolicy | undefined;
   readonly toolkit: Toolkit.Any | undefined;
   readonly limits: Limits | undefined;
+  /** How long a settled task is kept. Undefined: forever. */
+  readonly retention: Duration.Input | undefined;
 }
 
 /** How a generate call's answer is produced and checked (stored with the turn). */
@@ -111,6 +118,7 @@ export const agentObject = (config: HostConfig) => {
     const p = policyOf(tag);
     return Math.min(p.maxDelayMs, p.delayMs * 2 ** Math.max(0, attempts - 1));
   };
+  const retentionMs = config.retention === undefined ? undefined : Duration.toMillis(Duration.fromInputUnsafe(config.retention));
 
   return Effect.gen(function* () {
     const state = yield* Cloudflare.DurableObjectState;
@@ -144,6 +152,8 @@ export const agentObject = (config: HostConfig) => {
 
       // In-memory waiters for `wait`: released after a task's settling transaction commits.
       const waiters = new Map<string, Array<Deferred.Deferred<void>>>();
+      // The handler fiber of each task running in this execution, for `cancel`.
+      const inflight = new Map<string, Fiber.Fiber<unknown, unknown>>();
       const release = (taskId: string) =>
         Effect.suspend(() => {
           const ds = waiters.get(taskId) ?? [];
@@ -289,15 +299,18 @@ export const agentObject = (config: HostConfig) => {
         }
         let services = Context.merge(context, Context.make(AgentContext, { agent, taskId: row.task_id, attempt }));
         if (hasModel) services = Context.add(services, Generating, generating(row));
-        const exit = yield* handler({ payload: payload.success, taskId: row.task_id, attempt, agent }).pipe(
+        // Forked so `cancel` can interrupt it. Its outcome is then discarded: the cancel settled the task.
+        const fiber = yield* handler({ payload: payload.success, taskId: row.task_id, attempt, agent }).pipe(
           Effect.provideContext(services as Context.Context<unknown>),
           // Agent calls go through the outbox; a waiting one suspends the task.
           Effect.provideService(Calls, calls),
           Effect.provideService(ExternalTask, external),
           Effect.provideService(CurrentExecution, execution),
           Effect.annotateLogs({ agent: `${type}/${agent.name}`, taskId: row.task_id, attempt }),
-          Effect.exit,
+          Effect.forkChild,
         );
+        inflight.set(row.task_id, fiber);
+        const exit = yield* Effect.exit(Fiber.join(fiber)).pipe(Effect.ensuring(Effect.sync(() => inflight.delete(row.task_id))));
         if (exit._tag === "Success") {
           const encoded = yield* Schema.encodeUnknownEffect(json(rpc.successSchema))(exit.value).pipe(Effect.orDie);
           return { _tag: "Completed", result: encoded } as Outcome;
@@ -346,6 +359,23 @@ export const agentObject = (config: HostConfig) => {
               )
             : Inbox.retryLater(sql, row.seq, error, now() + backoff(row.task, attempts));
 
+      /**
+       * Retention: removes up to a batch of tasks that settled before `before`, with their turns,
+       * their calls, and delivered replies. A removed task id can be recorded again, as a new task.
+       * Runs at the end of a drain pass, so an agent prunes while it has work.
+       */
+      const prune = (before: number) =>
+        transaction(
+          Effect.gen(function* () {
+            for (const taskId of yield* Inbox.settledBefore(sql, before, PRUNE_BATCH)) {
+              yield* sessions.removeTask(taskId);
+              yield* outbox.removeCalls(taskId);
+              yield* Inbox.remove(sql, taskId);
+            }
+            yield* outbox.removeReplies(before);
+          }),
+        );
+
       const drainPass = Effect.gen(function* () {
         // The drain is single-flight per Durable Object, so a `running` row at the start of a
         // pass belongs to an execution that ended without settling it: a lost attempt.
@@ -372,6 +402,9 @@ export const agentObject = (config: HostConfig) => {
           // whoever waits for this task commit together.
           yield* transaction(
             Effect.gen(function* () {
+              // Canceled while the handler ran: the cancel settled it and told its subscribers.
+              // Record nothing of this execution, and send none of its calls.
+              if ((yield* Inbox.get(sql, row.task_id))?.status !== "running") return;
               if (result._tag === "Completed") yield* Effect.andThen(Inbox.complete(sql, row.seq, result.result, now()), flush);
               else if (result._tag === "Suspended") yield* Effect.andThen(Inbox.suspend(sql, row.seq), flush);
               else yield* afterFailure(row, attempt, result.error, result.permanent);
@@ -389,6 +422,7 @@ export const agentObject = (config: HostConfig) => {
           yield* release(row.task_id);
           processed++;
         }
+        if (retentionMs !== undefined) yield* prune(now() - retentionMs);
         const next = yield* Inbox.nextRunAt(sql);
         // `progress` must strictly increase, or Alchemy counts the reschedule as a retry.
         if (next !== undefined) yield* scheduleDrain(next, yield* Inbox.advanceCursor(sql));
@@ -442,6 +476,24 @@ export const agentObject = (config: HostConfig) => {
               });
               // Scheduled in the same transaction as the write (D4).
               if (isNew && !failure) yield* scheduleDrain(now());
+              // The task id is taken by another task or payload. The caller gets a failed record of
+              // its own (not stored): the recorded task is someone else's, so it can't be the answer.
+              const conflict = isNew ? undefined : Inbox.conflictWith(row, { task: tag, input: payload });
+              if (conflict !== undefined) {
+                const at = now();
+                const refused: Inbox.TaskRecord = {
+                  taskId,
+                  task: tag,
+                  status: "failed",
+                  attempts: 0,
+                  maxAttempts: 0,
+                  error: agentFailure(new InputConflict({ taskId, message: conflict })),
+                  causation: options.causation,
+                  createdAt: at,
+                  settledAt: at,
+                };
+                return { recorded: refused, isNew: false };
+              }
               return { recorded: Inbox.toRecord(row), isNew };
             }),
           );
@@ -493,6 +545,32 @@ export const agentObject = (config: HostConfig) => {
             return { resolved, record: yield* record(taskId) };
           }),
         tasks: (query) => Inbox.list(sql, query),
+        cancel: (taskId, options) =>
+          Effect.gen(function* () {
+            const reason = options.reason;
+            // One transaction: the task settles as Canceled, its turns end, its undelivered calls
+            // are dropped, and whoever waits for it is told.
+            const canceled = yield* transaction(
+              Effect.gen(function* () {
+                if (!(yield* Inbox.cancel(sql, taskId, agentFailure(new Canceled({ reason })), now()))) return undefined;
+                const events = yield* sessions.cancelTask(taskId, reason);
+                yield* outbox.dropCalls(taskId);
+                yield* outbox.notify(taskId);
+                return events;
+              }),
+            );
+            if (canceled !== undefined) {
+              // A handler running in this execution stops; whatever it does next isn't recorded.
+              const fiber = inflight.get(taskId);
+              if (fiber !== undefined) yield* Effect.forkDetach(Fiber.interrupt(fiber));
+              for (const { sessionId, event } of canceled) yield* sessions.emit(sessionId, event);
+              yield* release(taskId);
+              yield* Effect.logInfo("task.settled").pipe(
+                Effect.annotateLogs({ agent: `${type}/${agent.name}`, taskId, status: "failed", by: "cancel", reason }),
+              );
+            }
+            return { canceled: canceled !== undefined, record: yield* record(taskId) };
+          }),
       };
       return rpc;
     });

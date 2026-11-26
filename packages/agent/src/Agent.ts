@@ -13,11 +13,12 @@ import type * as LanguageModel from "effect/ai/LanguageModel";
 import type * as Tool from "effect/ai/Tool";
 import type * as Toolkit from "effect/ai/Toolkit";
 import * as Effect from "effect/Effect";
+import type * as Duration from "effect/Duration";
 import type * as Layer from "effect/Layer";
 import type * as Schema from "effect/Schema";
 import type { Rpc } from "effect/rpc";
 import { makeClient, type AgentClient, type AgentContract, type AgentRpc } from "./internal/client.ts";
-import { Agents, Generating, type Address, type AgentContext, type ExternalTask, type GenerationError, type RetryPolicy } from "./internal/core.ts";
+import { AgentError, Agents, Generating, Unreachable, type Address, type AgentContext, type ExternalTask, type GenerationError, type RetryPolicy } from "./internal/core.ts";
 import { agentObject, type Handler } from "./internal/runtime.ts";
 import type { Limits } from "./internal/session.ts";
 
@@ -27,9 +28,11 @@ export {
   AgentError,
   AgentErrorReason,
   Agents,
+  Canceled,
   ExecutionLost,
   GenerationError,
   GenerationFailed,
+  InputConflict,
   InvalidPayload,
   ModelError,
   Retry,
@@ -85,6 +88,12 @@ export interface ToLayerOptions<Tools extends Record<string, Tool.Any>> {
   /** Tools for this agent's `Agent.generate` turns. Their handlers are a Layer (`Toolkit.toLayer`). */
   readonly toolkit?: Toolkit.Toolkit<Tools>;
   readonly limits?: Limits;
+  /**
+   * How long a settled task is kept, with its turns and calls. Default: forever. Pruning happens
+   * while the agent has work, oldest first. A pruned task id is free again: sending it once more
+   * records a new task, so keep this longer than any caller might retry a send.
+   */
+  readonly retention?: Duration.Input;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +155,7 @@ export const make = <const Type extends string, const Rpcs extends ReadonlyArray
           retry: options?.retry,
           toolkit: options?.toolkit as Toolkit.Any | undefined,
           limits: options?.limits,
+          retention: options?.retention,
         }),
       ) as never;
     },
@@ -181,3 +191,29 @@ export const generate = <S extends Schema.Codec<any, any, never, never> = typeof
   Effect.flatMap(Effect.service(Generating), (g) =>
     g.run({ prompt: options.prompt, system: options.system, session: options.session, schema: options.schema }),
   ) as never;
+
+// ---------------------------------------------------------------------------
+// Agent.cancel
+// ---------------------------------------------------------------------------
+
+/**
+ * Cancels a task that hasn't settled. It settles as failed with `AgentError(Canceled)`, which is
+ * what anyone waiting for it gets. Its LLM turns end, and calls it made that weren't delivered yet
+ * are dropped (tasks it already sent to other agents keep running). A handler running at the time
+ * is interrupted, and nothing it does afterwards is recorded.
+ *
+ * Succeeds with `true` if this call canceled the task, `false` if it had already settled. An
+ * unknown task fails with `AgentError(Unreachable)`. A keyed task's id is `<Tag>:<primaryKey>`.
+ */
+export const cancel = (
+  agent: Address,
+  taskId: string,
+  options?: { readonly reason?: string },
+): Effect.Effect<boolean, AgentError> =>
+  Effect.flatMap(Effect.service(Agents), (agents) =>
+    Effect.flatMap(agents.transport(agent).cancel(taskId, options?.reason ?? ""), ({ canceled, record }) =>
+      record === null
+        ? Effect.fail(new AgentError({ agent, reason: new Unreachable({ message: `no task ${taskId}` }) }))
+        : Effect.succeed(canceled),
+    ),
+  );

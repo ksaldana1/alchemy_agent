@@ -81,12 +81,13 @@ than held in memory.
 A **task** is one durable request for an agent to do a named piece of work: `Review` with this
 payload. Tasks land in the agent's **inbox**, which the platform owns, not your code. Each task:
 
-- **is recorded once per task id.** Sending the same id again has no effect, so the task id is
-  also the idempotency key.
+- **is recorded once per task id.** Sending the same task and payload again has no effect, so the
+  task id is also the idempotency key. Sending the id with a different task or payload fails with
+  `AgentError(InputConflict)`.
 - **is delivered at least once.** A failure or a lost execution means another **attempt** with
   the same id.
-- **eventually settles:** completed with a result, or failed with a typed error. A settled task
-  never runs again.
+- **eventually settles:** completed with a result, failed with a typed error, or canceled. A
+  settled task never runs again.
 
 ### Contract, implementation, client
 
@@ -315,7 +316,8 @@ export const Reserve = Rpc.make("Reserve", {
 
 **Idempotency comes from the contract.** With a `primaryKey`, the task id is `<tag>:<key>`, so
 sending the same key twice records one task. A settled task never runs again, and its outcome
-never changes.
+never changes. The key stands for the payload: the same key with a different payload (key order
+aside) is refused with `AgentError(InputConflict)`, and nothing is recorded.
 
 ```ts
 export const Welcome = Rpc.make("Welcome", {
@@ -331,6 +333,21 @@ them per agent (`toLayer(…, { retry })`) or per task with an annotation:
 ```ts
 Rpc.make("Sync", { … }).annotate(Agent.Retry, { delay: "30 seconds", maxAttempts: 10 })
 ```
+
+**Cancellation.** `Agent.cancel(address, taskId, { reason })` settles a task that hasn't settled
+as `AgentError(Canceled)`, which is what anyone waiting for it gets. A running handler is
+interrupted and nothing it does afterwards is recorded; its LLM turns end; its calls that weren't
+delivered yet are dropped. Tasks it already sent to other agents keep running. It succeeds with
+`false` if the task had already settled.
+
+```ts
+yield* Agent.cancel(Reviewer.address("senior"), "Review:draft-42", { reason: "withdrawn" });
+```
+
+**Retention.** Settled tasks are kept forever by default. `toLayer(…, { retention: "30 days" })`
+prunes them (with their turns, their calls, and the transcripts of sessions they had to themselves)
+while the agent has work. A pruned task id is free again: sending it records a new task, so keep
+the retention longer than anyone might resend.
 
 ---
 
@@ -359,7 +376,7 @@ the platform can't deliver is one `AgentError` with a tagged `reason`:
 ```ts
 yield* reviewers("junior").Review({ path }).pipe(
   Effect.catchTag("FsDenied", () => reviewers("senior").Review({ path })), // declared by Review
-  Effect.catchTag("AgentError", (e) => …), // e.reason: Unreachable | RetriesExhausted | InvalidPayload | …
+  Effect.catchTag("AgentError", (e) => …), // e.reason: Unreachable | RetriesExhausted | Canceled | InputConflict | …
 );
 ```
 
@@ -624,8 +641,9 @@ Every route needs `Authorization: Bearer <AGENT_API_TOKEN>`.
 
 | Route | What it does |
 |---|---|
-| `POST /agents/:type/:name/tasks` `{ tag, payload, taskId? }` | Creates a task (`202`, the task record) |
+| `POST /agents/:type/:name/tasks` `{ tag, payload, taskId? }` | Creates a task (`202`, the task record). `409` if the task id is taken by another task or payload. |
 | `GET /agents/:type/:name/tasks/:taskId[?wait=1]` | Returns a task. `wait=1` holds the request until it settles (up to 20 s). |
+| `POST /agents/:type/:name/tasks/:taskId/cancel` `{ reason? }` | Cancels a task (`200`, the record; `409` if it had already settled) |
 | `GET /agents/:type/:name/tasks[?status=…]` | The agent's inbox |
 | `GET /agents[?type=…]` | Agents that have had work |
 | `GET /agents/:type/:name/sessions/:id[/events]` | A session's transcript, or its live SSE stream |

@@ -172,11 +172,15 @@ export const makeOutbox = (deps: OutboxDeps) => {
         yield* callAgent(target, (stub) => stub.reply(row.reply_id!, JSON.parse(row.record!)));
         return undefined;
       }
-      yield* callAgent(target, (stub) => stub.enqueue(row.task_id, row.tag!, JSON.parse(row.payload!), { causation: row.causation }));
+      const recorded = yield* callAgent(target, (stub) =>
+        stub.enqueue(row.task_id, row.tag!, JSON.parse(row.payload!), { causation: row.causation }),
+      );
       yield* Effect.logInfo("message.sent").pipe(
         Effect.annotateLogs({ to: `${target.type}/${target.name}`, task: row.tag, taskId: row.task_id, causation: row.causation }),
       );
       if (row.wait === 0) return undefined;
+      // Already settled (or refused: an `InputConflict` record isn't stored, so there's nothing to subscribe to).
+      if (recorded.status === "completed" || recorded.status === "failed") return recorded;
       // A recipient still on pre-M3 code has no `subscribe`: this fails and is retried.
       const record = yield* callAgent(target, (stub) => stub.subscribe(row.task_id, { type: self.type, name: self.name, id: row.id }));
       if (record === null) return yield* Effect.fail(new Error(`${target.type}/${target.name} has no task ${row.task_id}`));
@@ -286,7 +290,30 @@ export const makeOutbox = (deps: OutboxDeps) => {
   /** RPC `reply`: the answer to one of this agent's waiting calls. */
   const reply = (id: string, record: Inbox.TaskRecord) => transaction(settleCall(id, record));
 
-  return { calls, deliveryPass, subscribe, notify, reply };
+  // ---- Cancellation and retention --------------------------------------------------------
+
+  // Every call a task makes, from its handler (`<taskId>#c<n>`) or from a tool in one of its
+  // turns (`<taskId>#<i>/<toolCallId>#c<n>`), has an id that starts with `<taskId>#`.
+  const ownedBy = "substr(id, 1, ?) = ?";
+  const prefixOf = (taskId: string) => [`${taskId}#`.length, `${taskId}#`] as const;
+
+  /** In the transaction that cancels a task: its calls not yet delivered are never sent. */
+  const dropCalls = (taskId: string) =>
+    sql
+      .exec(`UPDATE alchemy_agent_outbox SET status = 'failed' WHERE kind = 'call' AND status = 'pending' AND ${ownedBy}`, ...prefixOf(taskId))
+      .pipe(Effect.asVoid);
+
+  /** Retention: removes the calls a pruned task made. */
+  const removeCalls = (taskId: string) =>
+    sql.exec(`DELETE FROM alchemy_agent_outbox WHERE kind = 'call' AND ${ownedBy}`, ...prefixOf(taskId)).pipe(Effect.asVoid);
+
+  /** Retention: removes replies that were delivered (or given up on) before `before`. */
+  const removeReplies = (before: number) =>
+    sql
+      .exec("DELETE FROM alchemy_agent_outbox WHERE kind = 'reply' AND status IN ('sent', 'failed') AND created_at < ?", before)
+      .pipe(Effect.asVoid);
+
+  return { calls, deliveryPass, subscribe, notify, reply, dropCalls, removeCalls, removeReplies };
 };
 
 export type Outbox = ReturnType<typeof makeOutbox>;
