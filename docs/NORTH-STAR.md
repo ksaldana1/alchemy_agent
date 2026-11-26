@@ -294,8 +294,8 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-As of 2026-11-26 the API reset and M3 to M5 are done, and the library has the shape above for
-what M1 to M5 cover:
+As of 2026-11-26 the API reset and M3 to M6 are done, and the library has the shape above for
+what M1 to M6 cover:
 
 - `Rpc` contracts and `Agent.make(type, [rpcs])`
 - `X.of` and `X.toLayer(impl, { retry, toolkit, limits })`
@@ -308,16 +308,16 @@ what M1 to M5 cover:
   `Workspace.FsDenied`, `Workspace.Toolkit` + `Workspace.ToolkitLayer`, and `Grant.read` /
   `Grant.write`
 - workflows as plain `effect/workflow`, with agent client calls as durable steps, and
-  `Platform.make({ main, agents, workflows, grants })`. `examples/newsroom` is this document's
-  newsroom, minus the listener, with `Signal.await(SignOff, { timeout })` standing in for
-  `Human.approval`.
+  `Platform.make({ main, agents, workflows, grants, listeners })`, with `Listen.files(...)` and
+  `Listen.cron(...)`. `examples/newsroom` is this document's newsroom, with
+  `Signal.await(SignOff, { timeout })` standing in for `Human.approval`.
 
 The Hello and support desk examples are written this way.
 
 Not yet:
 
 - **Wait timeouts and a per-agent allowlist** of who may call whom (left out of M3).
-- **The rest:** listeners (M6), human requests (M7), the run-stream demo client, and `Chaos.*`.
+- **The rest:** human requests (M7), the run-stream demo client, and `Chaos.*`.
 - **`HttpApi`.** The HTTP API is still routed by hand and doesn't use it.
 
 ## What is invented beyond the plan

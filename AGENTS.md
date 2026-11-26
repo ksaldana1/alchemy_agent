@@ -22,7 +22,8 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   `examples/hello/.env`, which is gitignored. The support desk (LLM agents on Workers AI):
   `bun run support:deploy|plan|destroy|demo`, with the same token in `examples/support-desk/.env`.
   `support:demo <url> workspace` is M4's deployed check (the workspace and its audit). The
-  newsroom (M5, workflows): `bun run newsroom:deploy|destroy|demo`, token in `examples/newsroom/.env`.
+  newsroom (M5 workflows, M6 listeners): `bun run newsroom:deploy|destroy|demo`, token in `examples/newsroom/.env`;
+  `newsroom:demo <url> submit|poison` is M6's deployed check.
 - `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
   replaces the live Worker with a local one.
 - The public API follows `effect/cluster`'s `Entity`: `Rpc` contracts in `Agent.make(type, [rpcs])`,
@@ -38,6 +39,11 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   takes the name first in Effect 4.1. Call agents from the workflow body, never inside an `Activity`.
   Host agents and workflows together with `Platform.layer` / `Platform.make`, which gives the engine
   to the agents (otherwise their replies can't reach a waiting run).
+- Stacks keep state with `Cloudflare.state()` (in Cloudflare, not `.alchemy/`), and the local test run
+  (`ALCHEMY_TEST_DEV=1`) uses the same `test_$USER` stage name. A resource that fails to create can leave a
+  record that blocks the next run; remove it with `bun --bun alchemy state rm -c <stack file> <Stack>/<stage>/<Resource>`
+  (records only, never cloud resources).
+- Local R2 sends no event notifications. Listener tests put events on the queue with `POST /listeners/events`.
 - No formatter is configured. Lines go up to about 140 columns. Don't run `prettier` with its
   defaults (80 columns).
 - A class-style `Context.Service` has no `.asEffect()`. Use `yield* Service` or

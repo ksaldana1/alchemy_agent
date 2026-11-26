@@ -17,6 +17,10 @@
 //   POST /workflows/:name/runs/:executionId/signals/:signal { value } → 202 (the first value counts)
 // Workflow routes need a workflow engine in the Worker (`Platform.layer` / `Platform.make`).
 //
+//   POST /listeners/events  { message }    → 202: puts a message on the listeners' queue (a replay of
+//                                            an R2 event, or { kind: "cron", listener, cron, scheduledTime })
+//   GET  /listeners/log     [?after=<seq>] → deliveries, failures, and dead letters
+//
 // `?wait=1` holds the request until the task settles (up to 20 s), then returns the record.
 // Every request needs `Authorization: Bearer <AGENT_API_TOKEN>`.
 import * as Config from "effect/Config";
@@ -44,6 +48,7 @@ import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import { DurableDeferred, type Workflow, WorkflowEngine } from "effect/workflow";
 import { registry } from "./internal/workflow.ts";
+import { listenerRuntime } from "./internal/listeners.ts";
 
 /** The env var (bound as a Worker secret) holding the API's bearer token. */
 export const TOKEN_ENV = "AGENT_API_TOKEN";
@@ -92,11 +97,26 @@ export const routes = (agents?: ReadonlyArray<{ readonly type: string }>, option
       const url = new URL(request.url, "http://local");
       const isWorkspace = url.pathname.startsWith("/workspace/");
       const isWorkflow = url.pathname.startsWith("/workflows/");
-      if (!url.pathname.startsWith(`${prefix}/`) && !isWorkspace && !isWorkflow) return undefined;
+      const isListeners = url.pathname.startsWith("/listeners/");
+      if (!url.pathname.startsWith(`${prefix}/`) && !isWorkspace && !isWorkflow && !isListeners) return undefined;
       if (!timingSafeEqual(request.headers["authorization"] ?? "", `Bearer ${Redacted.value(token)}`)) {
         return yield* json({ error: "unauthorized" }, 401);
       }
       if (isWorkspace) return yield* workspaceRoute(request, url);
+      if (isListeners) {
+        const listeners = listenerRuntime.current;
+        if (listeners === undefined) return yield* json({ error: "no listeners are hosted here" }, 404);
+        if (url.pathname === "/listeners/log" && request.method === "GET") {
+          return yield* json(yield* listeners.log(Number(url.searchParams.get("after") ?? 0) || 0));
+        }
+        if (url.pathname === "/listeners/events" && request.method === "POST") {
+          const body = (yield* request.json.pipe(Effect.option)).pipe(Option.getOrUndefined) as { message?: unknown } | undefined;
+          if (body?.message === undefined) return yield* json({ error: "body must be { message }" }, 400);
+          yield* listeners.send(body.message).pipe(Effect.orDie);
+          return yield* json({}, 202);
+        }
+        return yield* json({ error: "not found" }, 404);
+      }
       if (isWorkflow) {
         if (Option.isNone(engine)) return yield* json({ error: "no workflow engine is hosted here" }, 404);
         return yield* workflowRoute(engine.value, request, url);

@@ -111,12 +111,16 @@ const migrate = (sql: Sql) =>
     yield* sql.exec("INSERT INTO alchemy_workspace_schema (version) VALUES (?)", SCHEMA_VERSION);
   });
 
+/**
+ * The workspace's bucket. Declared by the workspace object, and again by listeners (for event
+ * notifications): the same logical id is one resource, so both declarations must agree.
+ */
+export const workspaceBucket = (forceDestroy: boolean) => Cloudflare.R2.Bucket(BUCKET_ID, forceDestroy ? { forceDestroy: true } : {});
+
 /** The construction Effect for the Workspace Durable Object class. */
 export const workspaceObject = (config: WorkspaceConfig) =>
   Effect.gen(function* () {
-    const files = yield* Cloudflare.R2.ReadWriteBucket(
-      Cloudflare.R2.Bucket(BUCKET_ID, config.forceDestroy ? { forceDestroy: true } : {}),
-    );
+    const files = yield* Cloudflare.R2.ReadWriteBucket(workspaceBucket(config.forceDestroy ?? false));
     const state = yield* Cloudflare.DurableObjectState;
 
     return Effect.gen(function* () {

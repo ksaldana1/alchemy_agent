@@ -389,6 +389,38 @@ Changes from the plan above, and why:
 same event is replayed by hand into the queue. A poison message lands in the DLQ and emits
 `listener.error`.
 
+**Status (2026-11-26): done.** Library: `Listen.ts` (`Listen.files(prefix, { suffix })` and
+`Listen.cron(expr)`, each `.start(workflow, map)` or `.send(agent, name, task, map)`),
+`internal/listeners.ts` (the queue, its dead-letter queue, the R2 notification rule, the
+consumers, the cron handler, and the `AgentListeners` log), `Platform.make({ listeners })`, and
+`POST /listeners/events` (replay) / `GET /listeners/log` in `Api.ts`. Tests:
+`test/listen.test.ts` (4 locally plus a real upload in the cloud; 5/5 on `test_$USER`). Deployed
+check on the newsroom (`dev_$USER`), whose listener is now the north star's:
+- `newsroom:demo <url> submit`: the upload alone started the publish run (3.6 s after the
+  write). A replay of the same R2 event by hand was a second delivery, and both deliveries
+  named the same run.
+- `newsroom:demo <url> poison`: garbage on the queue failed 4 times (the first delivery and 3
+  retries), was dead-lettered, recorded, and logged as `listener.error` (seen in Workers Logs
+  through `alchemy logs`).
+
+Changes from the plan above, and why:
+- **`Listen.files` over the workspace, not `Listen.r2(bucket)`** (as the north star planned):
+  a bucket name in agent code breaks principle 10. Paths are logical, and the bucket is the
+  workspace's.
+- **One queue per platform**, carrying R2 events, cron fires, and replays alike. The consumer
+  matches each message to its listeners, so cron fires get the same retries,
+  dead-lettering, and replay as files. Batches of 1, 3 retries 2 s apart.
+- **Exactly once comes from the target.** A run's key is the workflow's `idempotencyKey` of
+  the mapped payload, and a task's id is the Rpc's `primaryKey` or
+  `listener/<name>/<event id>` (`<path>@<etag>`, or the cron fire's `scheduledTime`). The queue
+  itself is at least once.
+- **A log of deliveries** (a small `AgentListeners` Durable Object): delivered (with the run or
+  task), failed, and dead-letter entries, readable at `GET /listeners/log`. That's what the
+  tests and the demo check.
+- **Locally there are no R2 notifications.** The rule is only created on live deploys
+  (`defaultProviderMode`). Local tests put the events on the queue themselves, which also
+  covers replays. Queues, retries, and the dead-letter queue do work locally.
+
 ## M7: Humans in the loop and inspection
 
 - Human requests: a typed response schema, states pending/resolved/expired/canceled, and a binding to an artifact revision (R2 etag). `POST /requests/:id/respond`. Resolving resumes the waiting session or workflow through the M3 mechanism.

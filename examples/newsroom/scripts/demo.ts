@@ -1,5 +1,7 @@
 // The newsroom against a deployed stage (M5's deployed check). From the repo root:
 //   bun run newsroom:demo <url> publish [name] [signOffWithin]   upload an article, start the run, wait for the reviews
+//   bun run newsroom:demo <url> submit [name]                    M6: upload only; the listener starts the run. Then replay the event
+//   bun run newsroom:demo <url> poison                           M6: put garbage on the listeners' queue; it's dead-lettered
 //   bun run newsroom:demo <url> approve <executionId> [yes|no]  sign off (or not), then wait for the outcome
 //   bun run newsroom:demo <url> status <executionId>
 // The token comes from AGENT_API_TOKEN (examples/newsroom/.env).
@@ -73,6 +75,47 @@ if (step === "publish") {
   if (s._tag === "Completed") console.log(`\n${await api("GET", `/workspace/files/${s.result.path}`)}`);
   const publish = await callTask("Intake", "intake", id, 6);
   if (publish?.status) console.log(`publish task: ${publish.status}, attempts ${publish.attempts}`);
+} else if (step === "submit") {
+  // M6: the upload alone starts the run (the listener), and a replay of its event starts nothing new.
+  const name = rest[0] ?? `bike-lanes-${Date.now().toString(36)}`;
+  const path = `shared/submissions/${name}.txt`;
+  const ref = await api("PUT", `/workspace/files/${path}`, ARTICLE, true);
+  const eventId = `${path}@${ref.revision}`;
+  console.log(`uploaded ${path} (revision ${ref.revision})`);
+  const deliveries = async () => ((await api("GET", "/listeners/log")) as any[]).filter((e) => e.eventId === eventId && e.kind === "delivered");
+  const t0 = Date.now();
+  let found: any[] = [];
+  for (let i = 0; i < 180 && found.length === 0; i++) {
+    await sleep(1000);
+    found = await deliveries();
+  }
+  console.log(`the listener started ${found[0]?.detail} after ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  // Replay the same R2 event by hand into the queue.
+  await api("POST", "/listeners/events", {
+    message: { action: "PutObject", bucket: "replay", object: { key: path, size: ref.size, eTag: ref.revision }, eventTime: new Date().toISOString() },
+  });
+  for (let i = 0; i < 60 && found.length < 2; i++) {
+    await sleep(1000);
+    found = await deliveries();
+  }
+  const runs = new Set(found.map((e) => e.detail));
+  console.log(`${found.length} deliveries of that event → ${runs.size} run(s): ${[...runs].join(", ")}`);
+  const id = found[0]?.detail.split("/").at(-1);
+  if (id) console.log(`run status: ${JSON.stringify(await status(id))}
+follow it: bun run newsroom:demo ${url} status ${id}`);
+} else if (step === "poison") {
+  const marker = `poison-${Date.now().toString(36)}`;
+  await api("POST", "/listeners/events", { message: { garbage: marker } });
+  console.log(`sent ${marker}; waiting for the dead letter (3 deliveries, 2 s apart, then the dead-letter queue)…`);
+  for (let i = 0; i < 120; i++) {
+    await sleep(2000);
+    const entries = ((await api("GET", "/listeners/log")) as any[]).filter((e) => e.message?.garbage === marker);
+    const dead = entries.find((e) => e.kind === "dead-letter");
+    if (dead) {
+      console.log(entries.map((e) => `  ${e.kind} (attempts ${e.attempts}): ${e.detail}`).join("\n"));
+      break;
+    }
+  }
 } else if (step === "status") {
   console.log(JSON.stringify(await status(rest[0]!), null, 2));
 }

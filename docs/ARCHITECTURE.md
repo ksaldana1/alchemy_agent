@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (2026-11-26):** principles, invariants, and what M1–M5 and the API reset built. The
+> **Status (2026-11-26):** principles, invariants, and what M1–M6 and the API reset built. The
 > rest of the component structure gets added as milestones land. The "Guiding decisions" table in
 > [PLAN.md](PLAN.md) is the working design for what isn't built yet.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
@@ -282,6 +282,37 @@ name.
 deferred with the encoded value; the run decodes it with its own schema. The first value wins,
 and later ones (or one after the timeout won the race) are ignored. A value sent before the run
 reaches the wait is kept.
+
+## Listeners (implemented in M6)
+
+**Declaring.** `Listen.files(prefix, { suffix })` (files written under a logical workspace path)
+or `Listen.cron(expr)`, each with `.start(workflow, map)` or `.send(agent, name, task, map)`, in
+`Platform.make({ listeners })`. A listener has a name (default `files:<prefix><suffix>` or
+`cron:<expr>`).
+
+**One queue per platform.** `AgentListenerEvents` carries:
+- the R2 notifications for the workspace bucket, one rule per listener key range (Cloudflare
+  rejects overlapping ranges in one configuration, so listeners on overlapping prefixes won't
+  deploy)
+- cron fires: the Worker's scheduled handler puts `{ kind: "cron", listener, cron,
+  scheduledTime }` on the queue
+- replays: `POST /listeners/events`
+
+The consumer (batches of 1) decodes each message, matches it to its listeners, maps the event to
+a payload, and starts the run (`workflow.execute(..., { discard: true })` on the engine) or
+enqueues the task on the agent (causation `listener/<name>`). Any failure (a mapping that throws,
+a payload that doesn't decode, an unreachable agent) retries the message: 3 retries, 2 s
+apart. Then it goes to `AgentListenerDeadLetters`, whose consumer logs `listener.error` and
+records it.
+
+**Exactly once.** The queue is at least once, and listeners don't dedupe. The target does: a
+run's execution id comes from the workflow's `idempotencyKey` of the payload, and a task's id
+from the Rpc's `primaryKey`, or else `listener/<name>/<event id>`, where the event id is
+`<path>@<etag>` or the fire's `scheduledTime`. A redelivered or replayed event recreates nothing.
+
+**The log.** The `AgentListeners` Durable Object records each delivery (with the run or task it
+created), each failure, and each dead letter (`GET /listeners/log`). Writing to it is best
+effort and never fails a delivery.
 
 ## LLM turns (implemented in M2)
 

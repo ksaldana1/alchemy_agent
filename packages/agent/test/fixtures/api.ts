@@ -8,6 +8,7 @@ import * as Api from "../../src/Api.ts";
 import { Echo, EchoLive, Flaky, FlakyLive, Relay, RelayLive } from "./agents.ts";
 import { Desk, DeskLive } from "./llm.ts";
 import * as Platform from "../../src/Platform.ts";
+import { listeners } from "./listeners.ts";
 import { workflows } from "./workflows.ts";
 import { Filer, FilerLive, grants, Librarian, LibrarianLive } from "./workspace.ts";
 
@@ -38,6 +39,7 @@ export default Cloudflare.Worker(
       Platform.layer({
         agents: [EchoLive, FlakyLive, RelayLive, DeskLive, FilerLive, LibrarianLive],
         workflows,
+        listeners,
         grants,
         workspace: { forceDestroy: true },
       }),
