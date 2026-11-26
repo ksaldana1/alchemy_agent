@@ -366,3 +366,47 @@ export const count = (sql: Sql, name: string) =>
   ).pipe(Effect.map((r) => r.value));
 
 export const isSettled = (row: Row) => row.status === "completed" || row.status === "failed";
+
+/**
+ * Settles a `waiting` task from outside its handler (M7: a person's answer). Returns whether it
+ * settled: a task that already settled, or isn't waiting, is left alone.
+ */
+export const resolveWaiting = (
+  sql: Sql,
+  taskId: string,
+  outcome: { readonly status: "completed"; readonly result: unknown } | { readonly status: "failed"; readonly error: StoredFailure },
+  now: number,
+) =>
+  Effect.flatMap(
+    outcome.status === "completed"
+      ? sql.exec<{ seq: number }>(
+          "UPDATE alchemy_agent_inbox SET status = 'completed', result = ?, settled_at = ? WHERE task_id = ? AND status = 'waiting' RETURNING seq",
+          JSON.stringify(outcome.result ?? null),
+          now,
+          taskId,
+        )
+      : sql.exec<{ seq: number }>(
+          "UPDATE alchemy_agent_inbox SET status = 'failed', error = ?, settled_at = ? WHERE task_id = ? AND status = 'waiting' RETURNING seq",
+          JSON.stringify(outcome.error),
+          now,
+          taskId,
+        ),
+    (c) => c.toArray(),
+  ).pipe(Effect.map((rows) => rows.length > 0));
+
+/** Tasks in arrival order, optionally only some statuses (inspection, M7). */
+export const list = (
+  sql: Sql,
+  options: { readonly statuses?: ReadonlyArray<string>; readonly taskId?: string; readonly after?: number; readonly limit?: number },
+) => {
+  const statuses = options.statuses ?? [];
+  const where = [
+    statuses.length > 0 ? `AND status IN (${statuses.map(() => "?").join(", ")})` : "",
+    options.taskId !== undefined ? "AND task_id = ?" : "",
+  ].join(" ");
+  const bindings = [...statuses, ...(options.taskId !== undefined ? [options.taskId] : [])];
+  return Effect.flatMap(
+    sql.exec<Row>(`SELECT * FROM alchemy_agent_inbox WHERE seq > ? ${where} ORDER BY seq LIMIT ?`, options.after ?? 0, ...bindings, Math.min(options.limit ?? 100, 500)),
+    (c) => c.toArray(),
+  ).pipe(Effect.map((rows) => rows.map((r) => ({ seq: r.seq, ...toRecord(r), input: JSON.parse(r.input) as unknown }))));
+};

@@ -3,8 +3,10 @@ import * as Workflows from "alchemy/Workflows";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { Activity, Workflow } from "effect/workflow";
+import * as Human from "../../src/Human.ts";
 import * as Signal from "../../src/Signal.ts";
 import { Echo, Flaky } from "./agents.ts";
+import { Filer } from "./workspace.ts";
 
 const Echoed = Schema.Struct({ echoed: Schema.String });
 
@@ -78,4 +80,31 @@ export const InActivityLive = Workflows.layer(
   }),
 );
 
-export const workflows = [GreetingLive, ApprovalLive, ShiftyLive, InActivityLive];
+/** M7: write a draft, then ask a person to approve exactly that revision. */
+export const HumanReview = Workflow.make("HumanReview", {
+  payload: { key: Schema.String, timeoutMs: Schema.Number },
+  success: Schema.Struct({
+    outcome: Schema.Literals(["approved", "rejected", "expired", "canceled"]),
+    by: Schema.NullOr(Schema.String),
+    path: Schema.String,
+    revision: Schema.String,
+  }),
+  idempotencyKey: ({ key }) => key,
+});
+export const HumanReviewLive = Workflows.layer(
+  HumanReview,
+  Effect.fn(function* ({ key, timeoutMs }) {
+    const draft = yield* (yield* Filer.client)(`drafter-${key}`).Write({ path: `~/drafts/${key}.md`, content: `draft ${key}` });
+    const base = { path: draft.path, revision: draft.revision };
+    return yield* Human.approval("sign-off", { artifact: draft.path, revision: draft.revision, timeout: `${timeoutMs} millis` }).pipe(
+      Effect.map((a) => ({ outcome: "approved" as const, by: a.by, ...base })),
+      Effect.catchTags({
+        NotApproved: (e) => Effect.succeed({ outcome: "rejected" as const, by: e.by, ...base }),
+        RequestExpired: () => Effect.succeed({ outcome: "expired" as const, by: null, ...base }),
+        RequestCanceled: (e) => Effect.succeed({ outcome: "canceled" as const, by: e.by, ...base }),
+      }),
+    );
+  }, Effect.orDie),
+);
+
+export const workflows = [GreetingLive, ApprovalLive, ShiftyLive, InActivityLive, HumanReviewLive];

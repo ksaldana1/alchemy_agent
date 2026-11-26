@@ -23,6 +23,7 @@ import {
   Calls,
   CurrentExecution,
   ExecutionLost,
+  ExternalTask,
   FsDenied,
   GenerationError,
   GenerationFailed,
@@ -41,6 +42,7 @@ import * as Inbox from "./inbox.ts";
 import { makeOutbox, type Outbox } from "./outbox.ts";
 import { makeSessions, type Limits, type OutputSpec } from "./session.ts";
 import { signalWorkflow } from "./workflow.ts";
+import { reportSeen } from "./registry.ts";
 import { WorkflowEngine } from "effect/workflow";
 import { DeferredModel } from "../AgentModel.ts";
 
@@ -50,6 +52,7 @@ const DRAIN_BATCH = 10;
 const DRAIN_CALLBACK = "alchemy-agent/drain";
 const STEP_CALLBACK = "alchemy-agent/step";
 const OUTBOX_CALLBACK = "alchemy-agent/outbox";
+const WAKE_CALLBACK = "alchemy-agent/wake";
 
 export type Handler = (request: {
   readonly payload: unknown;
@@ -154,6 +157,12 @@ export const agentObject = (config: HostConfig) => {
 
       let stepCallback: Alchemy.Callback<{ readonly v: 1; readonly turnId: string }> | undefined;
       let outboxCallback: Alchemy.Callback<{ readonly v: 1 }> | undefined;
+      let wakeCallback: Alchemy.Callback<{ readonly v: 1; readonly taskId: string }> | undefined;
+      /** M7: resume a waiting task at `at` (job id per task, so a rerun replaces it). */
+      const scheduleWake = (taskId: string, at: number) =>
+        Effect.flatMap(Inbox.advanceCursor(sql), (progress) =>
+          wakeCallback!.schedule(`wake:${taskId}`, { at: Math.max(at, now()), payload: { v: 1, taskId }, progress }).pipe(Effect.orDie),
+        );
       // Created below; `callsFor` and `wake` only run once the object is up.
       let outbox: Outbox;
       const causationOf = (taskId: string) => `${type}/${agent.name}/${taskId}`;
@@ -236,10 +245,29 @@ export const agentObject = (config: HostConfig) => {
 
       const execute = (row: Inbox.InboxRow, attempt: number): Effect.Effect<Executed, never, RuntimeContext> => {
         const calls = outbox.calls({ kind: "task", id: row.task_id, prefix: row.task_id, causation: causationOf(row.task_id) });
-        return Effect.map(run(row, attempt, calls.service), (outcome) => ({ outcome, flush: calls.flush }));
+        // M7: a task waiting for something outside (a person) may ask to be resumed at a time.
+        let wakeAt: number | null = null;
+        const external = ExternalTask.of({
+          waitUntil: (at) =>
+            Effect.suspend(() => {
+              wakeAt = at;
+              return Effect.die(new Suspend(row.task_id));
+            }),
+        });
+        // Recorded with the outcome: the calls made, and the wake-up, in the same transaction.
+        const flush = Effect.andThen(
+          calls.flush,
+          Effect.suspend(() => (wakeAt === null ? Effect.void : scheduleWake(row.task_id, wakeAt))),
+        );
+        return Effect.map(run(row, attempt, calls.service, external), (outcome) => ({ outcome, flush }));
       };
 
-      const run = Effect.fnUntraced(function* (row: Inbox.InboxRow, attempt: number, calls: Context.Service.Shape<typeof Calls>) {
+      const run = Effect.fnUntraced(function* (
+        row: Inbox.InboxRow,
+        attempt: number,
+        calls: Context.Service.Shape<typeof Calls>,
+        external: Context.Service.Shape<typeof ExternalTask>,
+      ) {
         const rpc: Rpc.AnyWithProps | undefined = contract.rpcs.get(row.task);
         const handler = handlers[row.task];
         if (rpc === undefined || handler === undefined) {
@@ -255,6 +283,7 @@ export const agentObject = (config: HostConfig) => {
           Effect.provideContext(services as Context.Context<unknown>),
           // Agent calls go through the outbox; a waiting one suspends the task.
           Effect.provideService(Calls, calls),
+          Effect.provideService(ExternalTask, external),
           Effect.provideService(CurrentExecution, execution),
           Effect.annotateLogs({ agent: `${type}/${agent.name}`, taskId: row.task_id, attempt }),
           Effect.exit,
@@ -363,16 +392,25 @@ export const agentObject = (config: HostConfig) => {
         { retry: { delay: "1 second" } },
       );
       // M3: delivers this agent's outbox (calls it makes, replies it owes).
+      // M7: resumes a task that waits for something outside, at the time it asked for.
+      wakeCallback = yield* Alchemy.makeCallback(
+        WAKE_CALLBACK,
+        (p: { readonly v: 1; readonly taskId: string }) => transaction(resumeTask(p.taskId)),
+        { retry: { delay: "1 second" } },
+      );
       outboxCallback = yield* Alchemy.makeCallback(OUTBOX_CALLBACK, (_: { readonly v: 1 }) => outbox.deliveryPass, {
         retry: { delay: "1 second" },
       });
 
+      /** Whether this activation has told the registry about this agent. */
+      let reported = false;
       const record = (taskId: string) =>
         Inbox.get(sql, taskId).pipe(Effect.map((row) => (row === undefined ? null : Inbox.toRecord(row))));
 
       const rpc: AgentRpc = {
         enqueue: (taskId, tag, payload, options) =>
-          transaction(
+          Effect.gen(function* () {
+          const { recorded, isNew } = yield* transaction(
             Effect.gen(function* () {
               const def = contract.rpcs.get(tag);
               // Unknown tasks and invalid payloads are recorded as failed, not thrown.
@@ -394,9 +432,16 @@ export const agentObject = (config: HostConfig) => {
               });
               // Scheduled in the same transaction as the write (D4).
               if (isNew && !failure) yield* scheduleDrain(now());
-              return Inbox.toRecord(row);
+              return { recorded: Inbox.toRecord(row), isNew };
             }),
-          ),
+          );
+          // M7: the registry learns about this agent once per activation (best effort).
+          if (isNew && !reported) {
+            reported = true;
+            yield* reportSeen(agent, now());
+          }
+          return recorded;
+          }),
         get: record,
         wait: (taskId, timeoutMs) =>
           Effect.gen(function* () {
@@ -419,6 +464,25 @@ export const agentObject = (config: HostConfig) => {
         events: (sessionId, after) => sessions.events(sessionId, after),
         subscribe: (taskId, replyTo) => outbox.subscribe(taskId, replyTo),
         reply: (id, record) => outbox.reply(id, record),
+        resolve: (taskId, outcome) =>
+          Effect.gen(function* () {
+            const resolved = yield* transaction(
+              Effect.gen(function* () {
+                const ok = yield* Inbox.resolveWaiting(sql, taskId, outcome, now());
+                if (ok) yield* outbox.notify(taskId);
+                return ok;
+              }),
+            );
+            if (resolved) {
+              yield* release(taskId);
+              const row = yield* Inbox.get(sql, taskId);
+              yield* Effect.logInfo("task.settled").pipe(
+                Effect.annotateLogs({ agent: `${type}/${agent.name}`, taskId, status: row?.status, causation: row?.causation, by: "resolve" }),
+              );
+            }
+            return { resolved, record: yield* record(taskId) };
+          }),
+        tasks: (query) => Inbox.list(sql, query),
       };
       return rpc;
     });

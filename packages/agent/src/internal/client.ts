@@ -162,6 +162,21 @@ export type AgentRpc = {
   subscribe: (taskId: string, replyTo: { readonly type: string; readonly name: string; readonly id: string }) => Effect.Effect<TaskRecord | null, never, any>;
   /** M3: the answer to a call this agent waits for (its outbox row `id`). Idempotent. */
   reply: (id: string, record: TaskRecord) => Effect.Effect<void, never, any>;
+  /**
+   * M7: settles a task that waits for something outside its handler (a person's answer). Only a
+   * `waiting` task settles; anything else is left alone (`resolved: false`).
+   */
+  resolve: (
+    taskId: string,
+    outcome: { readonly status: "completed"; readonly result: unknown } | { readonly status: "failed"; readonly error: StoredFailure },
+  ) => Effect.Effect<{ readonly resolved: boolean; readonly record: TaskRecord | null }, never, any>;
+  /** M7: the inbox, in arrival order (inspection). */
+  tasks: (query: {
+    readonly statuses?: ReadonlyArray<string>;
+    readonly taskId?: string;
+    readonly after?: number;
+    readonly limit?: number;
+  }) => Effect.Effect<ReadonlyArray<TaskRecord & { readonly seq: number; readonly input: unknown }>, never, any>;
 };
 
 export interface TranscriptEntry {

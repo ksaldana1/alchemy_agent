@@ -432,6 +432,44 @@ Changes from the plan above, and why:
 - a duplicate response is a no-op
 - an approval of a stale revision is rejected
 
+**Status (2026-11-26): done.** Library: `Human.ts` (`Human.request(name, { schema, prompt,
+artifact, timeout })`, `Human.approval(name, { artifact, revision, timeout })`, the errors
+`RequestExpired`, `RequestCanceled`, `NotApproved`, and the built-in `AgentHumans` agent), the
+`ExternalTask` service, the `wake` callback, the `resolve` and `tasks` RPCs in the runtime,
+`internal/registry.ts`, and the `/requests` routes, `GET /agents`, and
+`GET /agents/:type/:name/tasks` in `Api.ts`. Tests: `test/human.test.ts` (6, local and on
+`test_$USER`). Deployed checks on the newsroom (`dev_$USER`), whose sign-off is now the north
+star's `Human.approval` of the reviewed revision:
+- `newsroom:demo <url> publish`, then a `--force` redeploy while the sign-off request was
+  pending, then `approve`: the HTTP answer resumed the run, which published (the publish task
+  at 1 attempt)
+- the same `approve` answers a second time: `409 already settled`, and the request keeps the
+  first answer
+- `newsroom:demo <url> stale <run>`: the reviewed file was changed, and signing off the reviewed
+  revision was rejected as stale (409); the request stays pending
+
+Changes from the plan above, and why:
+- **A request is a task of a built-in agent, `AgentHumans/people`, that waits until settled from
+  outside.** So it waits the way any agent call does: a durable step in a workflow, a waiting call
+  in a handler or tool (M3's subscribe and reply), holding no execution either way. Its task id is the
+  call's position, so a rerun never asks twice. Statuses map from the task: waiting → pending,
+  completed → resolved, failed with `RequestExpired` / `RequestCanceled` → expired / canceled.
+- **Settling from outside** is a new RPC, `resolve(taskId, outcome)`, which settles only a
+  `waiting` task. The first answer wins, and a duplicate is a no-op (409).
+- **Expiry is a durable timer** (the `wake` callback) that resumes the task at `expiresAt`. The
+  handler then fails it with `RequestExpired`. The same mechanism (`ExternalTask.waitUntil`)
+  is what M3's deferred wait timeouts need. It's framework-internal for now.
+- **Revision binding is checked at answer time:** the answer must name the request's revision,
+  and that must still be the file's current revision (`409 stale` otherwise). Answers are
+  checked against the request's JSON Schema (`400`).
+- **Inspection without D1:** the inbox per agent (`GET /agents/:type/:name/tasks?status=`), and a
+  registry Durable Object for `GET /agents`. Each agent reports itself once per activation when
+  it gets a new task, which is eventually consistent, as planned. Session transcripts (M2) and
+  workflow status (M5) already existed.
+- **Not done:** a list of workflow runs (the engine has no index of runs), the WebSocket live
+  feed (optional), and authentication of who answers (`by` is whatever the caller says, behind
+  the API's bearer token).
+
 ## M8: Acceptance demo
 The target code for this demo is in [NORTH-STAR.md](NORTH-STAR.md).
 

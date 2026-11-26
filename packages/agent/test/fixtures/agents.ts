@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { Rpc } from "effect/rpc";
 import * as Agent from "../../src/Agent.ts";
+import * as Human from "../../src/Human.ts";
 import * as Testing from "../../src/Testing.ts";
 
 // ---------------------------------------------------------------------------
@@ -139,5 +140,30 @@ export const RelayLive = Relay.toLayer(
         return { echoed, runs };
       }),
     });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// M7: a handler that asks a person (the task waits for the answer)
+// ---------------------------------------------------------------------------
+
+export const AskBudget = Rpc.make("AskBudget", {
+  payload: { key: Schema.String, timeoutMs: Schema.Number },
+  success: Schema.Struct({ amount: Schema.Number, runs: Schema.Number }),
+  error: Schema.Union([Human.RequestExpired, Human.RequestCanceled]),
+  primaryKey: ({ key }) => key,
+});
+export const Clerk = Agent.make("Clerk", [AskBudget]);
+export const ClerkLive = Clerk.toLayer(
+  Clerk.of({
+    AskBudget: Effect.fn("Clerk.AskBudget")(function* ({ payload }) {
+      const runs = yield* Testing.count(`budget:${payload.key}`);
+      const { amount } = yield* Human.request("budget", {
+        schema: Schema.Struct({ amount: Schema.Number }),
+        prompt: `What's the budget for ${payload.key}?`,
+        timeout: `${payload.timeoutMs} millis`,
+      });
+      return { amount, runs };
+    }),
   }),
 );

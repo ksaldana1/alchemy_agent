@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (2026-11-26):** principles, invariants, and what M1–M6 and the API reset built. The
+> **Status (2026-11-26):** principles, invariants, and what M1–M7 and the API reset built. The
 > rest of the component structure gets added as milestones land. The "Guiding decisions" table in
 > [PLAN.md](PLAN.md) is the working design for what isn't built yet.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
@@ -213,7 +213,8 @@ afterwards.
 
 Lifecycle logs: `task.settled` and `message.sent` carry the causation. They go to Workers Logs.
 
-Not done yet: wait timeouts, and a per-agent allowlist of who may call whom.
+Not done yet: wait timeouts (M7's `ExternalTask.waitUntil` is the mechanism they need), and a
+per-agent allowlist of who may call whom.
 
 ## The workspace (implemented in M4)
 
@@ -313,6 +314,30 @@ from the Rpc's `primaryKey`, or else `listener/<name>/<event id>`, where the eve
 **The log.** The `AgentListeners` Durable Object records each delivery (with the run or task it
 created), each failure, and each dead letter (`GET /listeners/log`). Writing to it is best
 effort and never fails a delivery.
+
+## Human requests and inspection (implemented in M7)
+
+**A request is a task.** `Human.request` / `Human.approval` call the built-in agent
+`AgentHumans/people` with `Ask { name, prompt, schema (JSON Schema of the response), artifact
+(path and revision, or null), expiresAt }`. Its handler suspends with `ExternalTask.waitUntil(expiresAt)`:
+the task becomes `waiting`, and in the same transaction a `wake` job is scheduled for
+`expiresAt`. From then on:
+- **a person answers** (`POST /requests/:id/respond`): the API checks the response against the
+  schema, then, for an artifact, that the answer names the request's revision and that it is
+  still the file's current revision. Then it calls `resolve`, which settles the task only if
+  it's `waiting`, and notifies its subscribers in the same transaction, as any settling does.
+- **the deadline passes:** `wake` resumes the task, and the handler fails it with the declared
+  `RequestExpired`.
+- **someone cancels:** `resolve` fails it with `RequestCanceled`.
+
+Whoever made the request gets the answer the M3 way: a workflow run through its deferred, a
+task or tool through its outbox row. Each wait holds nothing. Because a request is identified by
+its call's position, a rerun or a replay finds the same request.
+
+**Inspection.** `GET /agents` reads a registry Durable Object (`AgentRegistry`), which agents
+report to once per activation when they get a new task (best effort, eventually consistent).
+`GET /agents/:type/:name/tasks?status=` lists an agent's inbox. `GET /requests?status=` lists
+human requests by state.
 
 ## LLM turns (implemented in M2)
 

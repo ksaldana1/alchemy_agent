@@ -23,7 +23,7 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   `bun run support:deploy|plan|destroy|demo`, with the same token in `examples/support-desk/.env`.
   `support:demo <url> workspace` is M4's deployed check (the workspace and its audit). The
   newsroom (M5 workflows, M6 listeners): `bun run newsroom:deploy|destroy|demo`, token in `examples/newsroom/.env`;
-  `newsroom:demo <url> submit|poison` is M6's deployed check.
+  `newsroom:demo <url> submit|poison` is M6's deployed check; `publish`, `approve`, and `stale` are M7's.
 - `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
   replaces the live Worker with a local one.
 - The public API follows `effect/cluster`'s `Entity`: `Rpc` contracts in `Agent.make(type, [rpcs])`,

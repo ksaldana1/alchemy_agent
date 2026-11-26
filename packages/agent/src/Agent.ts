@@ -17,7 +17,7 @@ import type * as Layer from "effect/Layer";
 import type * as Schema from "effect/Schema";
 import type { Rpc } from "effect/rpc";
 import { makeClient, type AgentClient, type AgentContract, type AgentRpc } from "./internal/client.ts";
-import { Agents, Generating, type Address, type AgentContext, type GenerationError, type RetryPolicy } from "./internal/core.ts";
+import { Agents, Generating, type Address, type AgentContext, type ExternalTask, type GenerationError, type RetryPolicy } from "./internal/core.ts";
 import { agentObject, type Handler } from "./internal/runtime.ts";
 import type { Limits } from "./internal/session.ts";
 
@@ -73,7 +73,7 @@ type HandlerServices<H> = {
 }[keyof H];
 
 /** Services the framework provides to handlers itself. */
-type Provided = AgentContext | Generating;
+type Provided = AgentContext | Generating | ExternalTask;
 
 /** Hosting an agent: what `toLayer` produces. A Worker provides it to host the agent. */
 export interface AgentHost<Type extends string> {

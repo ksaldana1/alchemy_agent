@@ -203,7 +203,8 @@ _Avoid_: Event (alone), message, notification
 
 **Human request**:
 A durable question for a person, expecting a typed response and bound to the context it is
-about. It ends up resolved, expired, or canceled.
+about. It ends up resolved, expired, or canceled (`Human.request`; answered with
+`POST /requests/:id/respond`).
 _Avoid_: Prompt, ask, ticket, notification
 
 **Approval**:

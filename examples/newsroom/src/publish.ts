@@ -1,6 +1,6 @@
 // The publish workflow (docs/NORTH-STAR.md): plain `effect/workflow`. Each agent call is a durable
 // step: it runs once, and the run waits for the answer without holding execution.
-import { Signal, Workspace } from "alchemy-agent";
+import { Human, Workspace } from "alchemy-agent";
 import * as Workflows from "alchemy/Workflows";
 import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -12,9 +12,6 @@ export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   by: Schema.String,
   notes: Schema.String,
 }) {}
-
-/** A person's sign-off, sent over the API: POST /workflows/PublishArticle/runs/<id>/signals/sign-off. */
-export const SignOff = Signal.make("sign-off", Schema.Struct({ approved: Schema.Boolean, by: Schema.String }));
 
 export const PublishArticle = Workflow.make("PublishArticle", {
   payload: {
@@ -53,12 +50,22 @@ export const PublishArticleLive = Workflows.layer(
     if (done.length === 0) return yield* new Rejected({ by: "nobody", notes: "no reviewer could read the article" });
     const rejection = done.find((r) => !r.approved);
     if (rejection) return yield* new Rejected({ by: rejection.by, notes: rejection.notes });
+    const review = done[0]!;
 
-    // A person signs off. No answer in time is a rejection; a late answer changes nothing.
-    const signOff = yield* Signal.await(SignOff, { timeout: (signOffWithin ?? "2 days") as Duration.Input }).pipe(
-      Effect.catchTag("SignalTimeout", () => Effect.succeed({ approved: false, by: "timeout" })),
+    // A person signs off on exactly the revision that was reviewed (GET /requests, then
+    // POST /requests/:id/respond). A sign-off for another revision is rejected by the platform.
+    yield* Human.approval("sign-off", {
+      artifact: review.path,
+      revision: review.revision,
+      prompt: `Publish "${name}"? ${review.by} approved it: ${review.notes}`,
+      timeout: (signOffWithin ?? "2 days") as Duration.Input,
+    }).pipe(
+      Effect.catchTags({
+        NotApproved: (e) => new Rejected({ by: e.by, notes: e.notes || "not signed off" }),
+        RequestExpired: () => new Rejected({ by: "timeout", notes: "not signed off in time" }),
+        RequestCanceled: (e) => new Rejected({ by: e.by, notes: `sign-off canceled: ${e.reason}` }),
+      }),
     );
-    if (!signOff.approved) return yield* new Rejected({ by: signOff.by, notes: "not signed off" });
 
     // Intake copies the edited file into the shared area, so it needs to read it too.
     yield* desk.Share({ path: edited.path, with: Intake.address("intake") });

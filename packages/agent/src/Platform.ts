@@ -18,7 +18,9 @@ import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Layer from "effect/Layer";
 import type { WorkflowEngine } from "effect/workflow";
 import * as Api from "./Api.ts";
+import { HumansLive } from "./Human.ts";
 import * as Listeners from "./internal/listeners.ts";
+import * as Registry from "./internal/registry.ts";
 import { trackRegistrations } from "./internal/workflow.ts";
 import type * as Listen from "./Listen.ts";
 import * as Workspace from "./Workspace.ts";
@@ -42,7 +44,14 @@ export interface Options {
  */
 export const layer = (options: Options): Layer.Layer<WorkflowEngine.WorkflowEngine, never, Cloudflare.Worker> => {
   const engine = trackRegistrations(Cloudflare.Workflows.layerDurableObjectEngine());
-  const parts: Array<Layer.Layer<any, never, any>> = [...options.agents, ...(options.workflows ?? [])];
+  // Human requests (M7) are tasks of the built-in AgentHumans agent.
+  const parts: Array<Layer.Layer<any, never, any>> = [
+    ...options.agents,
+    HumansLive,
+    // Inspection (M7): the registry of agents behind GET /agents.
+    Registry.layer as unknown as Layer.Layer<any, never, any>,
+    ...(options.workflows ?? []),
+  ];
   const listeners = options.listeners ?? [];
   const forceDestroy = options.workspace?.forceDestroy ?? false;
   // File listeners watch the workspace's bucket, so they host it too.

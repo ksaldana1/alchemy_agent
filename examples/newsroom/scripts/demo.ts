@@ -2,7 +2,9 @@
 //   bun run newsroom:demo <url> publish [name] [signOffWithin]   upload an article, start the run, wait for the reviews
 //   bun run newsroom:demo <url> submit [name]                    M6: upload only; the listener starts the run. Then replay the event
 //   bun run newsroom:demo <url> poison                           M6: put garbage on the listeners' queue; it's dead-lettered
-//   bun run newsroom:demo <url> approve <executionId> [yes|no]  sign off (or not), then wait for the outcome
+//   bun run newsroom:demo <url> approve <executionId> [yes|no]  sign off (or not) as a person, answer again (a no-op), wait for the outcome
+//   bun run newsroom:demo <url> stale <executionId>             M7: change the reviewed file, then try to sign off the old revision
+//   bun run newsroom:demo <url> requests                        the pending human requests
 //   bun run newsroom:demo <url> status <executionId>
 // The token comes from AGENT_API_TOKEN (examples/newsroom/.env).
 const [url, step, ...rest] = process.argv.slice(2);
@@ -33,7 +35,7 @@ const api = async (method: string, path: string, body?: unknown, raw = false): P
   }
 };
 const status = (id: string) => api("GET", `/workflows/PublishArticle/runs/${id}`);
-/** The task the run's n-th agent call created (calls: File, Edit, Share, junior Review, senior Review, Share, Publish). */
+/** The task the run's n-th agent call created (calls: File, Edit, Share, junior Review, senior Review, sign-off, Share, Publish). */
 const callTask = (type: string, name: string, id: string, n: number) =>
   api("GET", `/agents/${type}/${name}/tasks/${encodeURIComponent(`wf/PublishArticle/${id}/c${n}`)}`);
 const settled = (t: any) => t?.status === "completed" || t?.status === "failed";
@@ -60,21 +62,42 @@ if (step === "publish") {
   console.log(`  senior: ${senior.status}, ${JSON.stringify(senior.result ?? senior.error)}`);
   console.log(`  run:    ${JSON.stringify(await status(executionId))}`);
   console.log(`\nsign off: bun run newsroom:demo ${url} approve ${executionId}`);
-} else if (step === "approve") {
+} else if (step === "approve" || step === "stale") {
   const id = rest[0]!;
-  const approved = (rest[1] ?? "yes") === "yes";
-  console.log("before:", JSON.stringify(await status(id)));
-  await api("POST", `/workflows/PublishArticle/runs/${id}/signals/sign-off`, { value: { approved, by: "editor-in-chief" } });
-  let s: any;
-  for (let i = 0; i < 60; i++) {
-    s = await status(id);
-    if (s._tag !== "Running") break;
-    await sleep(1000);
+  // The run's sign-off is a human request (its causation is the run).
+  let request: any;
+  for (let i = 0; i < 120 && request === undefined; i++) {
+    request = ((await api("GET", "/requests")) as any[]).find((r) => r.causation === `workflow/PublishArticle/${id}`);
+    if (request === undefined) await sleep(1000);
   }
-  console.log("after: ", JSON.stringify(s));
-  if (s._tag === "Completed") console.log(`\n${await api("GET", `/workspace/files/${s.result.path}`)}`);
-  const publish = await callTask("Intake", "intake", id, 6);
-  if (publish?.status) console.log(`publish task: ${publish.status}, attempts ${publish.attempts}`);
+  if (request === undefined) throw new Error(`no pending request from run ${id}`);
+  console.log(`request ${request.id}: ${request.prompt}\n  about ${request.artifact.path} @ ${request.artifact.revision}`);
+  const respond = (by: string, approved: boolean) =>
+    api("POST", `/requests/${encodeURIComponent(request.id)}/respond`, { response: { approved }, by, revision: request.artifact.revision });
+  if (step === "stale") {
+    await api("PUT", `/workspace/files/${request.artifact.path}`, "Someone rewrote this after the review.", true);
+    console.log("changed the file after the review; signing off the reviewed revision:");
+    console.log("  ", JSON.stringify(await respond("editor-in-chief", true)));
+    console.log("request now:", (await api("GET", `/requests/${encodeURIComponent(request.id)}`)).status);
+  } else {
+    const approved = (rest[1] ?? "yes") === "yes";
+    const first = await respond("editor-in-chief", approved);
+    console.log(`answered: ${first.status} by ${first.answer?.by}`);
+    const second = await respond("someone-else", !approved);
+    console.log(`answered again: ${second.error} (the request stays ${second.request?.status}, by ${second.request?.answer?.by})`);
+    let s: any;
+    for (let i = 0; i < 60; i++) {
+      s = await status(id);
+      if (s._tag !== "Running") break;
+      await sleep(1000);
+    }
+    console.log("run:", JSON.stringify(s));
+    if (s._tag === "Completed") console.log(`\n${await api("GET", `/workspace/files/${s.result.path}`)}`);
+    const publish = await callTask("Intake", "intake", id, 7);
+    if (publish?.status) console.log(`publish task: ${publish.status}, attempts ${publish.attempts}`);
+  }
+} else if (step === "requests") {
+  console.log(JSON.stringify(await api("GET", "/requests"), null, 2));
 } else if (step === "submit") {
   // M6: the upload alone starts the run (the listener), and a replay of its event starts nothing new.
   const name = rest[0] ?? `bike-lanes-${Date.now().toString(36)}`;

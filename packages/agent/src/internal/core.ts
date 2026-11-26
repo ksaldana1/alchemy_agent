@@ -184,6 +184,16 @@ export class Calls extends Context.Service<
 >()("alchemy-agent/Calls") {}
 
 /**
+ * A task settled from outside its handler (M7: a person's answer). `waitUntil` suspends the task
+ * (it holds no execution) and, with a time, resumes it then so the handler can fail it (expiry).
+ * Until then only the `resolve` RPC settles it. Framework-internal; the `AgentHumans` agent uses it.
+ */
+export class ExternalTask extends Context.Service<
+  ExternalTask,
+  { readonly waitUntil: (resumeAt: number | null) => Effect.Effect<never> }
+>()("alchemy-agent/ExternalTask") {}
+
+/**
  * Raised (as a defect, so handler error handling doesn't swallow it) when a handler reaches an
  * unfinished turn or call: the task suspends and resumes when it settles.
  */

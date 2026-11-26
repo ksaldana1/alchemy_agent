@@ -160,6 +160,7 @@ export const platformOps = {
   read: (path: string) => Effect.flatMap(callWorkspace((stub) => stub.read(platform, path)), unwrap),
   write: (path: string, text: string) => Effect.flatMap(callWorkspace((stub) => stub.write(platform, path, text)), unwrap),
   list: (path: string) => Effect.flatMap(callWorkspace((stub) => stub.list(platform, path)), unwrap),
+  stat: (path: string) => Effect.flatMap(callWorkspace((stub) => stub.stat(platform, path)), unwrap),
   audit: (after: number) => callWorkspace((stub) => stub.audit(after)),
 };
 
