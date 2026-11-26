@@ -1,6 +1,7 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
 import * as Effect from "effect/Effect";
+import { Gateway } from "./src/llm.ts";
 import SpikesApi from "./src/worker.ts";
 
 export default Alchemy.Stack(
@@ -8,6 +9,7 @@ export default Alchemy.Stack(
   { providers: Cloudflare.providers(), state: Cloudflare.state() },
   Effect.gen(function* () {
     const api = yield* SpikesApi;
-    return { url: api.url };
+    const gateway = yield* Gateway;
+    return { url: api.url, gatewayId: gateway.gatewayId };
   }),
 );

@@ -4,12 +4,14 @@ import { HttpServerRequest } from "effect/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Agent from "./agent.ts";
 import Counter from "./counter.ts";
+import LlmProbe from "./llm.ts";
 import Probe from "./probe.ts";
+import * as Stream from "effect/Stream";
 import Echo from "./echo.ts";
 import Relay from "./relay.ts";
 
 // Spike Worker. Each spike owns one route prefix: 0.1 /counter, 0.2 /echo and /relay,
-// 0.3 /probe.
+// 0.3 /probe, 0.5 /llm.
 export default Cloudflare.Worker(
   "SpikesApi",
   { main: import.meta.url },
@@ -18,6 +20,7 @@ export default Cloudflare.Worker(
     const echoes = yield* Echo;
     const relays = yield* Relay;
     const probes = yield* Probe;
+    const llms = yield* LlmProbe;
     return {
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest;
@@ -48,6 +51,31 @@ export default Cloudflare.Worker(
           const relay = Agent.client(Relay, relays.getByName(decodeURIComponent(relayPost[1]!)));
           const handle = yield* relay.send(body.taskId, body.task as "relay", body.input as never);
           return yield* HttpServerResponse.json(handle);
+        }
+
+        // L7: GET /llm/:name/stream?text=…  → server-sent events, one per text delta.
+        const llmStream = path.match(/^\/llm\/([^/]+)\/stream$/);
+        if (llmStream) {
+          const url = new URL(request.url, "http://local");
+          const deltas = llms
+            .getByName(decodeURIComponent(llmStream[1]!))
+            .stream(url.searchParams.get("text") ?? "Count from 1 to 10.", url.searchParams.get("model") ?? "");
+          const sse = (deltas as unknown as Stream.Stream<string>).pipe(
+            Stream.map((d) => `data: ${JSON.stringify(d)}\n\n`),
+            Stream.encodeText,
+          );
+          return HttpServerResponse.stream(sse, { headers: { "content-type": "text/event-stream" } });
+        }
+
+        // /llm/:name/:method, like /probe (0.5).
+        const llm = path.match(/^\/llm\/([^/]+)\/([a-zA-Z]+)$/);
+        if (llm) {
+          const stub = llms.getByName(decodeURIComponent(llm[1]!)) as unknown as Record<
+            string,
+            (...args: ReadonlyArray<unknown>) => Effect.Effect<unknown>
+          >;
+          const args = request.method === "POST" ? ((yield* request.json) as ReadonlyArray<unknown>) : [];
+          return yield* HttpServerResponse.json(yield* stub[llm[2]!]!(...args));
         }
 
         // /probe/:name/:method. GET calls it with no arguments; POST takes a JSON array of them.

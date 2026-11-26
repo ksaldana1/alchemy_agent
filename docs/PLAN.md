@@ -64,10 +64,10 @@ examples/support-desk/   # LLM demo (port of mini-agent-runtime/examples/support
 
 ## M0: Foundation and spikes (stop and review after this milestone)
 
-> **Status (2026-11-25):** 0.1–0.3 are done (findings in `docs/spike/`). By decision on
+> **Status (2026-11-25):** 0.1–0.3 and 0.5 are done (findings in `docs/spike/`). D5 and D6 are
+> confirmed by 0.5, with caveats about Alchemy's Workers AI adapter (see 0.5's verdict). By decision on
 > 2026-11-25, M1 started without 0.4 and 0.5: 0.5 runs before M2 and 0.4 before M5, since only
-> those milestones depend on them. D1–D4 are confirmed by 0.2/0.3; D5, D6 and D9 stay proposed
-> until their spikes run.
+> those milestones depend on them. D1–D4 are confirmed by 0.2/0.3; D9 stays proposed until 0.4.
 
 **0.1 Scaffold.** Bun workspace. Pin exact versions of `alchemy`, `@alchemy.run/cloudflare`, `effect`,
 and `@alchemy.run/test`. Set up `alchemy profile edit --add Cloudflare`. The `examples/hello`
@@ -149,6 +149,12 @@ Changes from the plan above, and why:
   from the API). This is a start on the observability invariant.
 
 ## M2: LLM agents (first-class)
+
+> From 0.5: one step per durable callback (a model call with tool resolution disabled, or one
+> tool call), with tool arguments validated in the tool step (`toolCallValidation: "deferred"`).
+> Structured output goes through a forced `respond` tool. An empty model response is a retryable
+> failure. The live endpoint streams persisted steps, not raw tokens. Tools declare services with
+> `Tool.make(..., { dependencies })`. Default models: Llama 3.3 70B or Mistral Small 3.1.
 
 - `Agent.make("Assistant", { model, instructions, tools, tasks? })`. `tools` is an Effect AI `Toolkit` whose handlers run with the agent's services. A built-in task `prompt({ sessionId, message })` runs one **turn**.
 - **Sessions:** `sessions` and `transcript` tables in the agent DO. A turn is a loop of steps: `model_call` → zero or more `tool_call` → `model_call`, until a final answer. Each step is persisted before the next callback is scheduled (D6). Tool calls use idempotency key `(sessionId, stepIndex, toolCallId)`. Configurable limits: step cap, token budget, timeout per step.

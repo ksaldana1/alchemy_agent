@@ -232,8 +232,10 @@ Still to come:
 
 ## What it depends on
 
-- `Agent.prompt` with a structured `output` assumes spike 0.5 shows Workers AI (and the gateway)
-  can produce structured output, with every step checkpointed.
+- `Agent.prompt` with a structured `output`: spike 0.5 showed checkpointed steps work, and
+  that structured output works through a forced `respond` tool (`generateObject` doesn't work
+  through Alchemy's Workers AI adapter). The north star's
+  `AgentModel.gateway({ provider: "anthropic", … })` still needs a provider package and a key.
 - `Publish` assumes either engine from spike 0.4 can derive task ids from the run, replay
   `catchTag` deterministically (each agent call must be a recorded step), and resume after a
   redeploy.
