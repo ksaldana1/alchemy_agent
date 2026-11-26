@@ -1,4 +1,4 @@
-// M2: LLM agents on a scripted model. Local by default; `bun run test:cloud` runs it on test_$USER.
+// LLM agents on a scripted model. Local by default; `bun run test:cloud` runs it on test_$USER.
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Test from "@alchemy.run/test/Bun";
 import { expect } from "bun:test";
@@ -21,36 +21,29 @@ afterAll.skipIf(!!process.env.NO_DESTROY)(destroy(Stack));
 
 const run = crypto.randomUUID().slice(0, 8);
 const viaApi = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  Effect.flatMap(stack, ({ url }) => effect.pipe(Effect.provide(Api.connect({ url: url!, token }, Desk))));
+  Effect.flatMap(stack, ({ url }) => effect.pipe(Effect.provide(Api.connect({ url: url!, token }))));
 
-const getJson = (path: string) =>
+const getText = (path: string) =>
   Effect.flatMap(stack, ({ url }) =>
-    HttpClient.execute(HttpClientRequest.get(`${url}${path}`).pipe(HttpClientRequest.bearerToken(token))).pipe(
-      Effect.flatMap((r) => r.text),
-    ),
+    HttpClient.execute(HttpClientRequest.get(`${url}${path}`).pipe(HttpClientRequest.bearerToken(token))).pipe(Effect.flatMap((r) => r.text)),
   );
 type Entry = { seq: number; kind: string; message: { content: unknown } };
 const transcript = (agent: string, session: string) =>
-  Effect.map(getJson(`/agents/Desk/${agent}/sessions/${encodeURIComponent(session)}`), (t) => JSON.parse(t) as Entry[]);
-/** How many times `counter` was bumped in agent `agent`'s Durable Object. */
-const counted = (agent: string, counter: string) =>
-  Effect.map(Desk.named(agent).counter({ name: counter }), (r) => r.n);
+  Effect.map(getText(`/agents/Desk/${agent}/sessions/${encodeURIComponent(session)}`), (t) => JSON.parse(t) as Entry[]);
+const desk = (name: string) => Effect.map(Desk.client, (clients) => clients(name));
 
 const timeout = { timeout: 60_000 };
 
 test(
-  "the built-in prompt task: one turn with a tool call, persisted step by step",
+  "a generate turn with a tool call, persisted step by step",
   viaApi(
     Effect.gen(function* () {
       const { url } = yield* stack;
       yield* Test.getWhenReady(`${url}/shout/warmup`);
-      const desk = Desk.named(`a-${run}`);
-      expect(yield* desk.prompt({ message: "What is the status of order 42?", session: "s1" })).toEqual({
-        text: "Order 42 has shipped.",
-      });
-      const t = yield* transcript(`a-${run}`, "s1");
-      expect(t.map((e) => e.kind)).toEqual(["user", "model", "tool_result", "model"]);
-      expect(yield* counted(`a-${run}`, "lookup:42")).toBe(1);
+      const d = yield* desk(`a-${run}`);
+      expect(yield* d.Ask({ message: "What is the status of order 42?", session: "s1" })).toBe("Order 42 has shipped.");
+      expect((yield* transcript(`a-${run}`, "s1")).map((e) => e.kind)).toEqual(["user", "model", "tool_result", "model"]);
+      expect(yield* d.Counter({ name: "lookup:42" })).toBe(1);
     }),
   ),
   timeout,
@@ -60,12 +53,18 @@ test(
   "a crash mid-turn resumes at the failed step; earlier tool calls don't run again",
   viaApi(
     Effect.gen(function* () {
-      const desk = Desk.named(`chaos-${run}`);
-      expect(yield* desk.prompt({ message: "chaos please", session: "c" })).toEqual({ text: "done after chaos" });
-      expect(yield* counted(`chaos-${run}`, "lookup:7")).toBe(1); // the earlier tool: once
-      expect(yield* counted(`chaos-${run}`, "crashy")).toBe(2); // the crashing tool: at least once, so twice
-      const t = yield* transcript(`chaos-${run}`, "c");
-      expect(t.map((e) => e.kind)).toEqual(["user", "model", "tool_result", "model", "tool_result", "model"]);
+      const d = yield* desk(`chaos-${run}`);
+      expect(yield* d.Ask({ message: "chaos please", session: "c" })).toBe("done after chaos");
+      expect(yield* d.Counter({ name: "lookup:7" })).toBe(1); // the earlier tool: once
+      expect(yield* d.Counter({ name: "crashy" })).toBe(2); // the crashing tool: at least once, so twice
+      expect((yield* transcript(`chaos-${run}`, "c")).map((e) => e.kind)).toEqual([
+        "user",
+        "model",
+        "tool_result",
+        "model",
+        "tool_result",
+        "model",
+      ]);
     }),
   ),
   timeout,
@@ -75,19 +74,22 @@ test(
   "bad tool arguments become a failed tool result the model sees, not a failed turn",
   viaApi(
     Effect.gen(function* () {
-      expect(yield* Desk.named(`args-${run}`).prompt({ message: "bad args please" })).toEqual({ text: "fixed after error" });
+      expect(yield* (yield* desk(`args-${run}`)).Ask({ message: "bad args please" })).toBe("fixed after error");
     }),
   ),
   timeout,
 );
 
 test(
-  "Agent.prompt with an output schema, inside a task that keeps going after the prompt",
+  "generate with a struct schema, inside a handler that keeps going after it",
   viaApi(
     Effect.gen(function* () {
-      const out = yield* Desk.named(`review-${run}`).review({ article: "budget" });
       // The handler ran before the turn (and suspended), then again after it (and finished).
-      expect(out).toEqual({ approved: true, notes: "reads well", handlerRuns: 2 });
+      expect(yield* (yield* desk(`review-${run}`)).Review({ article: "budget" })).toEqual({
+        approved: true,
+        notes: "reads well",
+        handlerRuns: 2,
+      });
     }),
   ),
   timeout,
@@ -97,7 +99,7 @@ test(
   "a structured answer is forced through `respond` when the model replies in text",
   viaApi(
     Effect.gen(function* () {
-      expect(yield* Desk.named(`talk-${run}`).reviewTalkative({ article: "x" })).toEqual({ approved: false, notes: "forced" });
+      expect(yield* (yield* desk(`talk-${run}`)).ReviewTalkative({ article: "x" })).toEqual({ approved: false, notes: "forced" });
     }),
   ),
   timeout,
@@ -107,19 +109,32 @@ test(
   "an invalid structured answer goes back to the model, which answers again",
   viaApi(
     Effect.gen(function* () {
-      expect(yield* Desk.named(`sloppy-${run}`).reviewSloppy({ article: "x" })).toEqual({ approved: true, notes: "repaired" });
+      expect(yield* (yield* desk(`sloppy-${run}`)).ReviewSloppy({ article: "x" })).toEqual({ approved: true, notes: "repaired" });
     }),
   ),
   timeout,
 );
 
 test(
-  "a turn that never finishes hits the step cap: PromptFailed settles the task",
+  "generate is typed by its schema: literals through `respond`, string-encoded values from text",
   viaApi(
     Effect.gen(function* () {
-      const failed = yield* Effect.flip(Desk.named(`loop-${run}`).prompt({ message: "loop forever" }));
-      expect(failed).toMatchObject({ _tag: "TaskFailed", attempts: 1, error: { _tag: "PromptFailed" } });
-      expect(failed._tag === "TaskFailed" && failed.error.message).toContain("StepLimit");
+      const d = yield* desk(`poly-${run}`);
+      expect(yield* d.Pick({ question: "ship it?" })).toBe("reject");
+      // "lots" doesn't decode as a number: the model is asked again, and "42" does.
+      expect(yield* d.Count({ question: "mugs?" })).toBe(42);
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "a turn that never finishes hits the step cap: the task fails with GenerationFailed",
+  viaApi(
+    Effect.gen(function* () {
+      const error = yield* Effect.flip((yield* desk(`loop-${run}`)).Ask({ message: "loop forever" }));
+      expect(error.reason._tag).toBe("GenerationFailed");
+      expect(error.reason).toMatchObject({ message: expect.stringContaining("StepLimit") });
     }),
   ),
   timeout,
@@ -129,9 +144,8 @@ test(
   "empty model responses (swallowed provider errors) are retried, then fail the turn",
   viaApi(
     Effect.gen(function* () {
-      const failed = yield* Effect.flip(Desk.named(`empty-${run}`).prompt({ message: "empty please" }));
-      expect(failed).toMatchObject({ _tag: "TaskFailed", error: { _tag: "PromptFailed" } });
-      expect(failed._tag === "TaskFailed" && failed.error.message).toContain("empty response");
+      const error = yield* Effect.flip((yield* desk(`empty-${run}`)).Ask({ message: "empty please" }));
+      expect(error.reason).toMatchObject({ _tag: "GenerationFailed", message: expect.stringContaining("empty response") });
     }),
   ),
   timeout,
@@ -141,31 +155,26 @@ test(
   "a session remembers earlier turns",
   viaApi(
     Effect.gen(function* () {
-      const desk = Desk.named(`chat-${run}`);
-      yield* desk.prompt({ message: "my name is Ada", session: "chat" });
-      expect(yield* desk.prompt({ message: "what is my name?", session: "chat" })).toEqual({ text: "Your name is Ada." });
-      expect(yield* desk.prompt({ message: "what is my name?", session: "other" })).toEqual({ text: "I don't know." });
+      const d = yield* desk(`chat-${run}`);
+      yield* d.Ask({ message: "my name is Ada", session: "chat" });
+      expect(yield* d.Ask({ message: "what is my name?", session: "chat" })).toBe("Your name is Ada.");
+      expect(yield* d.Ask({ message: "what is my name?", session: "other" })).toBe("I don't know.");
     }),
   ),
   timeout,
 );
 
 test(
-  "turns in one session run one at a time, in order",
+  "turns in one session run one at a time",
   viaApi(
     Effect.gen(function* () {
-      const desk = Desk.named(`queue-${run}`);
-      const a = yield* desk.send.prompt({ message: "slow one", session: "q" });
-      const b = yield* desk.send.prompt({ message: "slow two", session: "q" });
-      expect(yield* a.result).toEqual({ text: "echo: slow one" });
-      expect(yield* b.result).toEqual({ text: "echo: slow two" });
-      const t = yield* transcript(`queue-${run}`, "q");
-      expect(t.map((e) => `${e.kind}:${JSON.stringify(e.message.content)}`)).toEqual([
-        `user:"slow one"`,
-        `model:"echo: slow one"`,
-        `user:"slow two"`,
-        `model:"echo: slow two"`,
-      ]);
+      const d = yield* desk(`queue-${run}`);
+      const [a, b] = yield* Effect.all([d.Ask({ message: "slow one", session: "q" }), d.Ask({ message: "slow two", session: "q" })], {
+        concurrency: "unbounded",
+      });
+      expect([a, b]).toEqual(["echo: slow one", "echo: slow two"]);
+      // Never interleaved: each user message is answered before the next one starts.
+      expect((yield* transcript(`queue-${run}`, "q")).map((e) => e.kind)).toEqual(["user", "model", "user", "model"]);
     }),
   ),
   timeout,
@@ -175,11 +184,11 @@ test(
   "the events endpoint replays the transcript as SSE, then ends when the session is idle",
   viaApi(
     Effect.gen(function* () {
-      yield* Desk.named(`sse-${run}`).prompt({ message: "What is the status of order 42?", session: "e" });
-      const body = yield* getJson(`/agents/Desk/sse-${run}/sessions/e/events`);
-      const events = body.split("\n\n").filter(Boolean).map((chunk) => chunk.match(/^event: (.*)$/m)?.[1]);
+      yield* (yield* desk(`sse-${run}`)).Ask({ message: "What is the status of order 42?", session: "e" });
+      const body = yield* getText(`/agents/Desk/sse-${run}/sessions/e/events`);
+      const events = body.split("\n\n").filter(Boolean).map((chunk) => chunk.match(/^event: (.*)$/m)?.[1] ?? "message"); // SSE's default event
       expect(events).toEqual(["message", "message", "message", "message", "idle"]);
-      const after = yield* getJson(`/agents/Desk/sse-${run}/sessions/e/events?after=2`);
+      const after = yield* getText(`/agents/Desk/sse-${run}/sessions/e/events?after=2`);
       expect(after.match(/^id: (\d+)$/gm)).toEqual(["id: 3", "id: 4"]);
     }),
   ),

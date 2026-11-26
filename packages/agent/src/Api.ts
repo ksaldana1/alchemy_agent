@@ -1,38 +1,32 @@
 // The agents' HTTP API, and how to reach agents over it.
 //
-//   POST {prefix}/:type/:name/tasks             { task, input, taskId? }  → 202 TaskRecord
-//   GET  {prefix}/:type/:name/tasks/:taskId     [?wait=<seconds>]        → TaskRecord | 404
-//   GET  {prefix}/:type/:name/sessions/:id      [?after=<seq>]           → transcript (LLM agents)
-//   GET  {prefix}/:type/:name/sessions/:id/events [?after=<seq>]         → SSE: the transcript, then
+//   POST {prefix}/:type/:name/tasks               { tag, payload, taskId? } → 202 TaskRecord
+//   GET  {prefix}/:type/:name/tasks/:taskId       [?wait=1]                → TaskRecord | 404
+//   GET  {prefix}/:type/:name/sessions/:id        [?after=<seq>]           → transcript
+//   GET  {prefix}/:type/:name/sessions/:id/events [?after=<seq>]           → SSE: the transcript, then
 //        new messages and turn changes until the session is idle; reconnect with ?after=<last seq>
 //
 // `?wait=1` holds the request until the task settles (up to 20 s), then returns the record.
 // Every request needs `Authorization: Bearer <AGENT_API_TOKEN>`.
 import * as Config from "effect/Config";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
-import * as Redacted from "effect/Redacted";
-import * as Schedule from "effect/Schedule";
-import * as Context from "effect/Context";
+import * as Sse from "effect/encoding/Sse";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
-import { HttpServerRequest } from "effect/http/HttpServerRequest";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
+import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
-import {
-  AgentUnreachable,
-  reachKey,
-  waiterKey,
-  type AgentClass,
-  type AgentType,
-  type Reach,
-  type Transport,
-  type Waiter,
-} from "./internal/core.ts";
-import type { TaskRecord } from "./internal/inbox.ts";
-import { bindingTransport, type AgentRpc, type Namespace } from "./internal/ref.ts";
-import type { SessionEvent } from "./internal/session.ts";
+import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
+import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { bindingTransport, stubFor } from "./internal/client.ts";
+import { AgentError, Agents, Unreachable, type Address, type Transport } from "./internal/core.ts";
+import { TaskRecord } from "./internal/inbox.ts";
+import type { SessionEvent } from "./internal/session.ts";
 
 /** The env var (bound as a Worker secret) holding the API's bearer token. */
 export const TOKEN_ENV = "AGENT_API_TOKEN";
@@ -47,143 +41,163 @@ const timingSafeEqual = (a: string, b: string) => {
 
 const json = (body: unknown, status = 200) => HttpServerResponse.json(body, { status }).pipe(Effect.orDie);
 
+/** The body of POST …/tasks. */
+const EnqueueBody = Schema.Struct({
+  tag: Schema.String,
+  payload: Schema.optionalKey(Schema.Unknown),
+  taskId: Schema.optionalKey(Schema.String),
+});
+/** The API's own "not found" (as opposed to a 404 from the edge). */
+const ApiNotFound = Schema.Struct({ error: Schema.Literal("not found") });
+
 export interface Routes {
   /** Handles requests under the prefix; anything else gets `undefined`, so you can route it. */
-  readonly handle: Effect.Effect<HttpServerResponse.HttpServerResponse | undefined, never, HttpServerRequest>;
+  readonly handle: Effect.Effect<HttpServerResponse.HttpServerResponse | undefined, never, HttpServerRequest.HttpServerRequest>;
 }
 
 /**
  * The agents' HTTP API, mounted in your own Worker. In the construction phase:
- * `const api = yield* Api.routes({ agents: [Greeter] })`; in `fetch`:
- * `return (yield* api.handle) ?? (yield* yourOwnRoutes)`.
+ * `const api = yield* Api.routes([Greeter, Desk])`; in `fetch`:
+ * `return (yield* api.handle) ?? (yield* yourOwnRoutes)`. The Worker must also host the agents
+ * (provide their Layers).
  */
-export const routes = <const Agents extends ReadonlyArray<AgentClass>>(options: {
-  readonly agents: Agents;
-  /** Default `/agents`. */
-  readonly prefix?: string;
-}) =>
+export const routes = (agents: ReadonlyArray<{ readonly type: string }>, options?: { readonly prefix?: string }) =>
   Effect.gen(function* () {
     const token = yield* Config.Redacted(TOKEN_ENV);
-    const prefix = (options.prefix ?? "/agents").replace(/\/$/, "");
-    const byType = new Map<string, Namespace>();
-    for (const agent of options.agents) {
-      byType.set(agent.definition.name, (yield* (agent as unknown as Effect.Effect<Namespace>)) as Namespace);
-    }
+    const prefix = (options?.prefix ?? "/agents").replace(/\/$/, "");
+    const types = new Set(agents.map((a) => a.type));
 
     const handle = Effect.gen(function* () {
-      const request = yield* HttpServerRequest;
+      const request = yield* HttpServerRequest.HttpServerRequest;
       const url = new URL(request.url, "http://local");
       if (!url.pathname.startsWith(`${prefix}/`)) return undefined;
       if (!timingSafeEqual(request.headers["authorization"] ?? "", `Bearer ${Redacted.value(token)}`)) {
         return yield* json({ error: "unauthorized" }, 401);
       }
-      const sessionMatch = url.pathname.slice(prefix.length).match(/^\/([^/]+)\/([^/]+)\/sessions\/([^/]+)(\/events)?$/);
-      if (sessionMatch && request.method === "GET") {
-        const ns = byType.get(decodeURIComponent(sessionMatch[1]!));
-        if (!ns) return yield* json({ error: "not found" }, 404);
-        const stub = ns.getByName(decodeURIComponent(sessionMatch[2]!)) as AgentRpc;
-        const sessionId = decodeURIComponent(sessionMatch[3]!);
-        const after = Number(url.searchParams.get("after") ?? 0) || 0;
-        if (sessionMatch[4] === undefined) return yield* json(yield* stub.transcript(sessionId, after));
+      const rest = url.pathname.slice(prefix.length);
+      const after = Number(url.searchParams.get("after") ?? 0) || 0;
+
+      const session = rest.match(/^\/([^/]+)\/([^/]+)\/sessions\/([^/]+)(\/events)?$/);
+      if (session && request.method === "GET") {
+        const address: Address = {
+          type: decodeURIComponent(session[1]!),
+          name: decodeURIComponent(session[2]!),
+        };
+        if (!types.has(address.type)) return yield* json({ error: "not found" }, 404);
+        const stub = yield* stubFor(address);
+        const sessionId = decodeURIComponent(session[3]!);
+        if (session[4] === undefined) return yield* json(yield* stub.transcript(sessionId, after));
         const sse = (stub.events(sessionId, after) as Stream.Stream<SessionEvent>).pipe(
-          Stream.map((e) => `${e.type === "message" ? `id: ${e.seq}\n` : ""}event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`),
+          Stream.map((e) =>
+            Sse.encoder.write({
+              _tag: "Event",
+              event: e.type,
+              id: e.type === "message" ? String(e.seq) : undefined,
+              data: JSON.stringify(e),
+            }),
+          ),
           Stream.encodeText,
         );
         return HttpServerResponse.stream(sse, {
-          headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+          },
         });
       }
-      const m = url.pathname.slice(prefix.length).match(/^\/([^/]+)\/([^/]+)\/tasks(?:\/([^/]+))?$/);
-      const namespace = m ? byType.get(decodeURIComponent(m[1]!)) : undefined;
-      if (!m || !namespace) return yield* json({ error: "not found" }, 404);
-      // The binding transport retries a failed RPC (e.g. the Durable Object reset mid-call).
-      const transport = bindingTransport(namespace, decodeURIComponent(m[2]!), null);
 
-      if (m[3] === undefined && request.method === "POST") {
-        const body = (yield* request.json.pipe(Effect.orElseSucceed(() => null))) as {
-          task?: unknown;
-          input?: unknown;
-          taskId?: unknown;
-        } | null;
-        if (body === null || typeof body.task !== "string") {
-          return yield* json({ error: "body must be { task, input, taskId? }" }, 400);
-        }
-        const taskId = typeof body.taskId === "string" ? body.taskId : crypto.randomUUID();
-        return yield* json(yield* transport.enqueue(taskId, body.task, body.input ?? {}), 202);
+      const task = rest.match(/^\/([^/]+)\/([^/]+)\/tasks(?:\/([^/]+))?$/);
+      if (!task) return yield* json({ error: "not found" }, 404);
+      const address: Address = {
+        type: decodeURIComponent(task[1]!),
+        name: decodeURIComponent(task[2]!),
+      };
+      if (!types.has(address.type)) return yield* json({ error: "not found" }, 404);
+      // The binding transport retries a failed RPC (e.g. the Durable Object reset mid-call).
+      const transport = bindingTransport(address);
+
+      if (task[3] === undefined && request.method === "POST") {
+        const body = yield* HttpServerRequest.schemaBodyJson(EnqueueBody).pipe(Effect.option);
+        if (body._tag === "None") return yield* json({ error: "body must be { tag, payload?, taskId? }" }, 400);
+        const { tag, payload, taskId = crypto.randomUUID() } = body.value;
+        return yield* json(yield* transport.enqueue(taskId, tag, payload ?? null), 202);
       }
-      if (m[3] !== undefined && request.method === "GET") {
-        const taskId = decodeURIComponent(m[3]);
-        const wait = (Number(url.searchParams.get("wait") ?? 0) || 0) > 0;
-        const record = yield* wait ? transport.wait(taskId) : transport.get(taskId);
+      if (task[3] !== undefined && request.method === "GET") {
+        const taskId = decodeURIComponent(task[3]);
+        const record = yield* url.searchParams.has("wait") ? transport.wait(taskId) : transport.get(taskId);
         return yield* record === null ? json({ error: "not found" }, 404) : json(record);
       }
       return yield* json({ error: "method not allowed" }, 405);
     }).pipe(
-      Effect.catchTag("AgentUnreachable", (e) => json({ error: e.message }, 503)),
-    ) as Effect.Effect<HttpServerResponse.HttpServerResponse | undefined, never, HttpServerRequest>;
+      Effect.catchTag("AgentError", (e) => json({ error: String(e.reason._tag), message: e.message }, 503)),
+      Effect.withSpan("Api.handle"),
+    ) as Effect.Effect<HttpServerResponse.HttpServerResponse | undefined, never, HttpServerRequest.HttpServerRequest>;
 
     return { handle } satisfies Routes;
   });
 
 /**
- * From outside Cloudflare (a script, a test): a Layer that reaches the listed agents over the HTTP
- * API. `Greeter.named("a").greet({ name }).pipe(Effect.provide(Api.connect({ url, token }, Greeter)))`.
+ * From outside Cloudflare (a script, a test): reach agents over the HTTP API. Every client
+ * (`yield* Greeter.client`) then goes over HTTP: `program.pipe(Effect.provide(Api.connect({ url, token })))`.
  */
-export const connect = <const Agents extends ReadonlyArray<AgentClass>>(
-  options: { readonly url: string; readonly token: string | Redacted.Redacted<string> },
-  ...agents: Agents
-): Layer.Layer<Reach<AgentType<Agents[number]>> | Waiter, never, HttpClient.HttpClient> =>
-  Layer.effectContext(
+export const connect = (options: {
+  readonly url: string;
+  readonly token: string | Redacted.Redacted<string>;
+}): Layer.Layer<never, never, HttpClient.HttpClient> =>
+  Layer.effect(
+    Agents,
     Effect.gen(function* () {
-      const client = yield* HttpClient.HttpClient;
       const token = typeof options.token === "string" ? options.token : Redacted.value(options.token);
       const base = options.url.replace(/\/$/, "");
+      // Transient failures (network, timeouts, 5xx) are retried; a 400 or 401 is not.
+      const http = (yield* HttpClient.HttpClient).pipe(
+        HttpClient.mapRequest(HttpClientRequest.bearerToken(token)),
+        HttpClient.retryTransient({
+          schedule: Schedule.exponential("200 millis"),
+          times: 5,
+        }),
+      );
 
-      const send = (request: HttpClientRequest.HttpClientRequest) =>
-        client.execute(request.pipe(HttpClientRequest.bearerToken(token))).pipe(
-          Effect.flatMap((res) =>
-            Effect.flatMap(res.text, (text) => {
-              let body: unknown = undefined;
-              try {
-                body = JSON.parse(text);
-              } catch {}
-              const apiError = (body as { error?: unknown } | undefined)?.error;
-              // Only the API's own "not found" means the task doesn't exist. A 404 from the edge
-              // (a fresh workers.dev URL still converging) is retried like any other failure.
-              if (res.status === 404 && request.method === "GET" && apiError === "not found") return Effect.succeed(null);
-              if (res.status >= 200 && res.status < 300 && body !== undefined) return Effect.succeed(body as TaskRecord);
-              return Effect.fail(
-                new AgentUnreachable({ message: `HTTP ${res.status}: ${String(apiError ?? text.slice(0, 200))}` }),
-              );
+      const transport = (agent: Address): Transport => {
+        const tasks = `${base}/agents/${encodeURIComponent(agent.type)}/${encodeURIComponent(agent.name)}/tasks`;
+        const send = (request: HttpClientRequest.HttpClientRequest): Effect.Effect<TaskRecord | null, AgentError> =>
+          Effect.gen(function* () {
+            const res = yield* http.execute(request);
+            // Only the API's own "not found" means the task doesn't exist. A 404 from the edge
+            // (a fresh workers.dev URL still converging) is retried.
+            if (res.status === 404 && request.method === "GET") {
+              yield* HttpClientResponse.schemaBodyJson(ApiNotFound)(res).pipe(Effect.mapError(() => new EdgeNotReady()));
+              return null;
+            }
+            return yield* HttpClientResponse.filterStatusOk(res).pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(TaskRecord)));
+          }).pipe(
+            Effect.retry({
+              while: (e) => e._tag === "EdgeNotReady",
+              schedule: Schedule.exponential("500 millis"),
+              times: 8,
             }),
-          ),
-          Effect.catchTag("HttpClientError", (e) => Effect.fail(new AgentUnreachable({ message: e.message }))),
-          // Every operation is idempotent, so a 5xx or a dropped connection is retried.
-          Effect.retry({ schedule: Schedule.exponential("200 millis"), times: 5 }),
-        );
-
-      const transport = (type: string) => (name: string): Transport => {
-        const tasks = `${base}/agents/${encodeURIComponent(type)}/${encodeURIComponent(name)}/tasks`;
+            Effect.mapError(
+              (e) =>
+                new AgentError({
+                  agent,
+                  reason: new Unreachable({
+                    message: e._tag === "EdgeNotReady" ? "the API isn't reachable yet (404 from the edge)" : e.message,
+                  }),
+                }),
+            ),
+          );
         return {
-          enqueue: (taskId, task, input) =>
+          enqueue: (taskId, tag, payload) =>
             send(
-              HttpClientRequest.post(tasks).pipe(
-                HttpClientRequest.setBody(HttpBody.jsonUnsafe({ taskId, task, input })),
-              ),
-            ) as Effect.Effect<TaskRecord, AgentUnreachable>,
+              HttpClientRequest.post(tasks).pipe(HttpClientRequest.setBody(HttpBody.jsonUnsafe({ taskId, tag, payload }))),
+            ) as Effect.Effect<TaskRecord, AgentError>,
           get: (taskId) => send(HttpClientRequest.get(`${tasks}/${encodeURIComponent(taskId)}`)),
-          wait: (taskId) =>
-            send(HttpClientRequest.get(`${tasks}/${encodeURIComponent(taskId)}?wait=1`)),
+          wait: (taskId) => send(HttpClientRequest.get(`${tasks}/${encodeURIComponent(taskId)}?wait=1`)),
         };
       };
-
-      let context = Context.make(waiterKey, true as const);
-      for (const agent of agents) {
-        context = Context.add(context, reachKey(agent.definition.name), { transport: transport(agent.definition.name) });
-      }
-      return context as unknown as Context.Context<Reach<AgentType<Agents[number]>> | Waiter>;
+      return { transport };
     }),
-  );
+  ) as unknown as Layer.Layer<never, never, HttpClient.HttpClient>;
 
-// Re-exported for Workers that build their own transports.
-export { bindingTransport };
+/** A 404 that isn't the API's own answer: the edge hasn't converged yet. */
+class EdgeNotReady extends Data.TaggedError("EdgeNotReady")<{}> {}

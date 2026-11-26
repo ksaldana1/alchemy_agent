@@ -14,7 +14,7 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
 ## Gotchas
 
 - In Effect 4.1, the modules are `effect/ai`, `effect/http`, and `effect/workflow`. Older docs and examples use `effect/unstable/*`.
-- Run the Alchemy CLI from the repo root with `bun run alchemy …` (or `bun run dev|deploy|plan|destroy`). These run it inside `spikes/` under Bun. A bare `bunx alchemy` at the root fetches a temporary copy that can't load `@effect/platform-bun`.
+- Run the Alchemy CLI from the repo root with `bun run alchemy …` (or `bun run dev|deploy|plan|destroy`). The CLI's own default stage for `deploy`/`plan`/`destroy` is `live_$USER`. The scripts pass `--stage dev_$USER`, so add `--stage dev_$USER` yourself when you run `bun run alchemy deploy` directly. Non-interactive deploys need `--yes`. These run it inside `spikes/` under Bun. A bare `bunx alchemy` at the root fetches a temporary copy that can't load `@effect/platform-bun`.
 - Bun uses its isolated linker here, so each workspace package declares every dependency it imports.
 - Commands. Library tests: `bun run test` (local workerd) and `bun run test:cloud` (deploys
   `test_$USER`, then destroys it). Spike suites: `bun run test:spikes[:cloud]`. The Hello
@@ -23,6 +23,12 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   `bun run support:deploy|plan|destroy|demo`, with the same token in `examples/support-desk/.env`.
 - `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
   replaces the live Worker with a local one.
+- The public API follows `effect/cluster`'s `Entity`: `Rpc` contracts in `Agent.make(type, [rpcs])`,
+  `X.toLayer(X.of({ … }), { retry, toolkit, limits })`, `(yield* X.client)(name).Task(payload)`,
+  and one `Agent.generate({ prompt, schema? })`. `docs/NORTH-STAR.md` shows the target. New API
+  should look like Effect's, not like a framework of its own.
+- No formatter is configured. Lines go up to about 140 columns. Don't run `prettier` with its
+  defaults (80 columns).
 - A class-style `Context.Service` has no `.asEffect()`. Use `yield* Service` or
   `Effect.service(Service)`.
 - TypeScript 7 can hide later errors in a file while earlier ones are present. Check each

@@ -2,6 +2,7 @@
 // Every function here is a storage operation; the drain loop in `Agent.ts` sequences them.
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 /** The `SqlStorage` wrapper from `Cloudflare.DurableObjectState`'s storage. */
 export interface Sql {
@@ -19,29 +20,39 @@ export interface Sql {
 }
 
 /** `waiting`: suspended on a prompt's turn (M2); it resumes as `pending` when the turn settles. */
-export type TaskStatus = "pending" | "running" | "waiting" | "completed" | "failed";
+export type TaskStatus = TaskRecord["status"];
 
-/** A failure as stored: the tag and message survive, class identity does not. */
-export interface StoredFailure {
-  readonly _tag: string;
-  readonly message: string;
-}
+/**
+ * A failure as stored, and as it crosses the wire:
+ * - `declared`: one of the task's declared errors, encoded with its Rpc error schema; the caller
+ *   decodes it back into the real error
+ * - `agent`: an `AgentError` reason (encoded), e.g. retries exhausted or execution lost
+ * - `attempt`: the last retryable failure of a task that will be delivered again
+ */
+export const StoredFailure = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("declared"), value: Schema.Unknown }),
+  Schema.Struct({ kind: Schema.Literal("agent"), reason: Schema.Unknown }),
+  Schema.Struct({ kind: Schema.Literal("attempt"), message: Schema.String }),
+]);
+export type StoredFailure = typeof StoredFailure.Type;
 
 /** A task as stored in the inbox and returned over RPC and HTTP. */
-export interface TaskRecord {
-  readonly taskId: string;
-  readonly task: string;
-  readonly status: TaskStatus;
-  readonly attempts: number;
-  readonly maxAttempts: number;
-  /** The handler's output, in its encoded (JSON) form. Present when `completed`. */
-  readonly result?: unknown;
-  /** The last failure. Present when `failed`, and on a `pending` task that will retry. */
-  readonly error?: StoredFailure;
-  readonly causation: string | null;
-  readonly createdAt: number;
-  readonly settledAt: number | null;
-}
+export const TaskRecord = Schema.Struct({
+  taskId: Schema.String,
+  task: Schema.String,
+  status: Schema.Literals(["pending", "running", "waiting", "completed", "failed"]),
+  attempts: Schema.Number,
+  maxAttempts: Schema.Number,
+  /** The handler's output, encoded with the task's success schema. Present when `completed`. */
+  result: Schema.optionalKey(Schema.Unknown),
+  /** The failure. Present when `failed`, and on a `pending` task that will retry. */
+  error: Schema.optionalKey(StoredFailure),
+  causation: Schema.NullOr(Schema.String),
+  createdAt: Schema.Number,
+  settledAt: Schema.NullOr(Schema.Number),
+});
+
+export type TaskRecord = typeof TaskRecord.Type;
 
 type Row = {
   seq: number;
@@ -114,13 +125,14 @@ const MIGRATIONS: ReadonlyArray<string> = [
      PRIMARY KEY (session_id, seq)
    );
    CREATE TABLE alchemy_agent_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);`,
+  // API reset: a turn's system prompt (per `Agent.generate` call).
+  `ALTER TABLE alchemy_agent_turns ADD COLUMN system TEXT;`,
 ];
 
-export const migrate = (
+export const migrate = Effect.fnUntraced(function* (
   sql: Sql,
   transaction: <A>(effect: Effect.Effect<A, never, RuntimeContext>) => Effect.Effect<A, never, RuntimeContext>,
-) =>
-  Effect.gen(function* () {
+) {
     yield* sql.exec(
       "CREATE TABLE IF NOT EXISTS alchemy_agent_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)",
     );

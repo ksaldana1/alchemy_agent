@@ -91,12 +91,15 @@ export const EditorLive = Editor.toLayer(
         Agent.generate({
           system: "You are a copy editor. Fix grammar, tighten prose, never change facts.",
           prompt: `Edit ${path} and save it to ~/edited/${name}.md.`,
-          toolkit: Workspace.Toolkit, // read / write / list, checked against grants
           schema: Workspace.FileRef,
         }),
       Share: ({ payload }) => Workspace.share(payload.path, payload.with, "read"),
     });
   }),
+  // The agent's tools (read / write / list, checked against grants). They belong to the agent,
+  // not the call: a turn outlives the execution that started it, so its tools must be known
+  // whenever the Durable Object wakes.
+  { toolkit: Workspace.Toolkit },
 ).pipe(Layer.provide([AgentModel.workersAI("@cf/meta/llama-3.3-70b-instruct-fp8-fast"), Workspace.ToolkitLayer]));
 
 export const ReviewerLive = Reviewer.toLayer(
@@ -281,14 +284,25 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-As of 2026-11-26, the library still has the M1/M2 API: `Agent.make<Self>()(name, { tasks })` with
-`Agent.task`, references (`X.named(n).task(...)`, `send.*`, `handle`), `uses`, `Agent.prompt`,
-`Agent.tools`, and errors flattened to `{ _tag, message }`. The API reset (in progress) moves it
-to the shape above: `Rpc` contracts, `toLayer` / `of`, `client`, declared errors, `primaryKey`,
-`Agent.generate`, toolkit Layers, and `Schema.TaggedError` throughout.
+As of 2026-11-26 the API reset is done, and the library has the shape above for what M1 and M2
+cover:
 
-Still to come after the reset: waiting inside a handler (M3), the workspace (M4), workflows (M5),
-listeners (M6), human requests (M7), and `Platform.make`.
+- `Rpc` contracts and `Agent.make(type, [rpcs])`
+- `X.of` and `X.toLayer(impl, { retry, toolkit, limits })`
+- `X.client` and `{ discard: true }`
+- declared errors, `primaryKey`, and the per-task `Agent.Retry` annotation
+- `Agent.generate` with a schema, the model as a Layer, and the toolkit's handlers as a Layer
+- `Schema.TaggedError` throughout, with `AgentError` carrying a tagged reason
+
+The Hello and support desk examples are written this way.
+
+Not yet:
+
+- **Waiting inside a handler (M3).** A handler can only send with `{ discard: true }`. Waiting
+  fails with `AgentError` (reason `WaitingInHandler`).
+- **The rest:** the workspace (M4), workflows (M5), listeners (M6), human requests (M7), and
+  `Platform.make`.
+- **`HttpApi`.** The HTTP API is still routed by hand and doesn't use it.
 
 ## What is invented beyond the plan
 

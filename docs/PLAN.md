@@ -46,7 +46,10 @@ when you do.
 
 ```
 packages/agent/          # the library: "alchemy-agent"
-  src/Agent.ts           # Agent.make, Agent.task, Agent.tool, type helpers
+  src/Agent.ts           # Agent.make (Rpc contracts), of / toLayer / client, Agent.generate
+  src/AgentModel.ts      # models as Layers (Workers AI, AI Gateway, scripted)
+  src/internal/client.ts # clients and the Durable Object binding transport
+  src/internal/runtime.ts# the agent's Durable Object: inbox RPCs, drain, step callbacks
   src/internal/inbox.ts  # SQLite inbox, drain loop, outbox
   src/internal/session.ts# LLM turn state machine + transcript
   src/Workspace.ts       # R2 + D1 grants service
@@ -193,10 +196,42 @@ Changes from the plan above, and why:
 - **Not done:** the support desk's QA judge and the shared files (they need the workspace and
   workflows, M4/M5); `AgentModel.gateway` for Anthropic/OpenAI (waiting on a key, 0.5/L6).
 
+## API reset (after M2, 2026-11-26)
+
+The M1/M2 API had grown its own vocabulary (`Agent.task`, `named(n).task(...)`, `send.*`, `uses`,
+`Agent.prompt`, errors flattened to `{ _tag, message }`). It was replaced by Effect's own idioms,
+following `effect/cluster`'s `Entity` (see [NORTH-STAR.md](NORTH-STAR.md) and
+[ARCHITECTURE.md](ARCHITECTURE.md), "Agents as Rpc groups"):
+
+- **Contracts are `Rpc`s:** `Agent.make("Greeter", [Greet])`, with `payload`, `success`, `error`,
+  and `primaryKey`. Contracts live apart from implementations, so callers import only schemas.
+- **Implementations:** `X.toLayer(X.of({ … }), { retry, toolkit, limits })`. The Layer declares
+  the Durable Object in whichever Worker provides it. The model and the tool handlers are
+  requirements that `Layer.provide` supplies.
+- **Callers:** `(yield* X.client)(name).Task(payload)`, with `{ discard: true }`. Inside
+  Cloudflare the client resolves the binding from the Worker's environment, so `uses` is gone.
+  `Api.connect` replaces the transport outside Cloudflare.
+- **Errors:** declared errors reach callers as themselves. Platform failures are one `AgentError`
+  with a tagged `reason` (`Effect.catchReason`).
+- **Generation:** one `Agent.generate({ prompt, system?, session?, schema? })`, typed by its
+  schema. A string-encoded schema means a text answer, anything else means the `respond` tool.
+- **Per-task retry:** the `Agent.Retry` Rpc annotation.
+- **Internals:** `Schema.TaggedError` throughout; stored records are schemas (`TaskRecord`);
+  `Effect.fn` / `fnUntraced` instead of functions returning `Effect.gen`; the HTTP client uses
+  `HttpClient.retryTransient` and `schemaBodyJson`; SSE frames come from `Sse.encoder`.
+
+Verified: `inbox.test.ts` (16) and `llm.test.ts` (12) locally and on `test_$USER`, the type
+tests, Hello's deployed checks (including a pending task across a redeploy), and the support
+desk's chat, tickets, and redeploy mid-turn. The existing Durable Object classes upgraded in
+place.
+
+Deferred: serving the HTTP API through `HttpApi` (it would give a typed client and OpenAPI for
+free, but the routes are generic over agents, so it needs a design pass).
+
 ## M3: Agent-to-agent messaging and durable waits
 
-- **Outbox:** `Agent.send(Reviewer.named("junior"), "review", input)` writes an outbox row in the sender's transaction. A callback delivers it to the recipient's `enqueue`. The `taskId` is derived from (sender step, send index), so a redelivery never duplicates.
-- **Delegate and wait (D7):** `Agent.call(...)` inside a task, or an auto-generated `ask_<agent>` tool for LLM agents. It sends, then marks the session or task `waiting` and returns. When the recipient completes, it sends a `reply` back to the sender's inbox, which resumes the waiting step with the result. A wait timeout produces a timeout result.
+- **Outbox:** `reviewers("junior").Review(payload, { discard: true })` inside a handler writes an outbox row in the sender's transaction. A callback delivers it to the recipient's `enqueue`. The `taskId` is derived from (sender step, send index), so a redelivery never duplicates.
+- **Delegate and wait (D7):** waiting on a client call inside a task (today it fails with `WaitingInHandler`), or an auto-generated `ask_<agent>` tool for LLM agents. It sends, then marks the session or task `waiting` and returns. When the recipient completes, it sends a `reply` back to the sender's inbox, which resumes the waiting step with the result. A wait timeout produces a timeout result.
 - Sender identity comes from the calling DO, never from a field in the payload. A simple per-agent allowlist controls who can send to whom.
 - Lifecycle events (`task.*`, `message.sent`, `session.step`) carry a causation ID and go to structured logs (Workers Logs). Analytics Engine can come later.
 

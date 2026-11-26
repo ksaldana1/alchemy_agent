@@ -9,7 +9,7 @@ import { Api } from "alchemy-agent";
 import * as Effect from "effect/Effect";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as Schedule from "effect/Schedule";
-import { Helpdesk, Responder, Triage } from "../src/agents.ts";
+import { Helpdesk, Responder, Triage } from "../src/contracts.ts";
 
 const [url, step, ...rest] = process.argv.slice(2);
 const token = process.env[Api.TOKEN_ENV];
@@ -44,18 +44,18 @@ const printSteps = (entries: ReadonlyArray<Entry>) => {
 };
 
 const program = Effect.gen(function* () {
+  const helpdesk = (yield* Helpdesk.client)("front");
   if (step === "tickets") {
-    const triage = Triage.named("front");
-    const handles = [];
-    for (const [name, ticket] of Object.entries(TICKETS)) {
-      handles.push({ name, handle: yield* triage.send.triage({ name, ticket }, { taskId: `${run}-${name}` }) });
-    }
+    const triage = (yield* Triage.client)(`front-${run}`);
+    const responder = (yield* Responder.client)("desk");
     const rows = yield* Effect.forEach(
-      handles,
-      ({ name, handle }) =>
+      Object.entries(TICKETS),
+      ([name, ticket]) =>
         Effect.gen(function* () {
-          const t = yield* handle.result;
-          const r = yield* Responder.named("desk").handle("respond", `${handle.taskId}:respond`).result;
+          const key = `${run}-${name}`;
+          const t = yield* triage.TriageTicket({ name: key, ticket });
+          // Same key, same task: this waits for the one triage already sent.
+          const r = yield* responder.Respond({ name: key, ticket, triage: t });
           return {
             ticket: name,
             category: t.category,
@@ -73,28 +73,29 @@ const program = Effect.gen(function* () {
     const [session = `chat-${run}`, ...words] = rest;
     const message = words.join(" ") || "What is the status of order 42?";
     const t0 = Date.now();
-    const answer = yield* Helpdesk.named("front").prompt({ message, session });
-    console.log(`answer (${Date.now() - t0} ms): ${answer.text}\nsteps:`);
+    const answer = yield* helpdesk.Chat({ message, session });
+    console.log(`answer (${Date.now() - t0} ms): ${answer}\nsteps:`);
     printSteps(JSON.parse(yield* get(`/agents/Helpdesk/front/sessions/${session}`)));
   } else if (step === "events") {
     console.log(yield* get(`/agents/Helpdesk/front/sessions/${rest[0]}/events`));
   } else if (step === "redeploy-start") {
     const session = `redeploy-${run}`;
-    const handle = yield* Helpdesk.named("front").send.prompt({ message: "How many blue mugs are in stock at the warehouse?", session });
+    yield* helpdesk.Chat({ message: "How many blue mugs are in stock at the warehouse?", session }, { discard: true });
     // Wait until the slow tool has been called, so the redeploy lands mid-turn.
     yield* get(`/agents/Helpdesk/front/sessions/${session}`).pipe(
       Effect.repeat({ schedule: Schedule.spaced("500 millis"), until: (t) => t.includes("check_warehouse"), times: 60 }),
     );
     console.log(`mid-turn: the model called check_warehouse (~15 s). Redeploy now, then:`);
-    console.log(`bun run support:demo ${url} redeploy-finish ${session}/${handle.taskId}`);
+    console.log(`bun run support:demo ${url} redeploy-finish ${session}`);
   } else if (step === "redeploy-finish") {
-    const [session, taskId] = rest[0]!.split("/") as [string, string];
-    const answer = yield* Helpdesk.named("front").handle("prompt", taskId).result;
-    console.log(`answer after the redeploy: ${answer.text}\nsteps:`);
+    const session = rest[0]!;
+    // Wait on the session's events until it's idle, then show the transcript.
+    yield* get(`/agents/Helpdesk/front/sessions/${session}/events`);
+    console.log("the turn finished after the redeploy. steps:");
     printSteps(JSON.parse(yield* get(`/agents/Helpdesk/front/sessions/${session}`)));
   }
 });
 
 await Effect.runPromise(
-  program.pipe(Effect.provide(Api.connect({ url, token }, Triage, Responder, Helpdesk)), Effect.provide(FetchHttpClient.layer)),
+  program.pipe(Effect.provide(Api.connect({ url, token })), Effect.provide(FetchHttpClient.layer)),
 );

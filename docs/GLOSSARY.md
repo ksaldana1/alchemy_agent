@@ -62,14 +62,21 @@ settled task never runs again.
 _Avoid_: Done, finished, resolved
 
 **Permanent failure**:
-A failure that settles a task right away, without further attempts. Examples: invalid input, an
-unknown task name, a denied permission, or an error the agent marks as permanent.
+A failure that settles a task right away, without further attempts. Examples: an invalid
+payload, an unknown task name, a denied permission, or a declared error.
 _Avoid_: Fatal error, non-retryable error
 
-**Task handle**:
-What a caller holds after creating a task: its task id, plus the means to check its status and
-await its result.
-_Avoid_: Future, promise, receipt
+**Declared error**:
+An error listed in a task's contract (the Rpc's `error` schema). It settles the task right away
+and reaches the caller as itself. Any other failure is retried, and reaches the caller as an
+`AgentError` once the attempts run out.
+_Avoid_: Business error, expected error
+
+**Client**:
+How code calls an agent: `(yield* Greeter.client)("a").Greet(payload)`. It waits for the result,
+or only sends with `{ discard: true }`. How it reaches the agent (bindings or HTTP) comes from the
+context.
+_Avoid_: Reference, handle, proxy, stub (a stub is Cloudflare's lower-level object)
 
 ### Agents working together
 

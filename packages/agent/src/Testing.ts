@@ -17,9 +17,8 @@ export const crashExecution: Effect.Effect<never> = Effect.gen(function* () {
  * Increments a durable counter in the agent's Durable Object and returns the new value. It
  * survives crashes and resets, so tests can count how often a handler or tool really ran.
  */
-export const count = (name: string): Effect.Effect<number> =>
-  Effect.gen(function* () {
-    const execution = yield* CurrentExecution;
-    if (execution === undefined) return yield* Effect.die(new Error("not inside a task or tool"));
-    return yield* execution.count(name);
-  });
+export const count: (name: string) => Effect.Effect<number> = Effect.fnUntraced(function* (name: string) {
+  const execution = yield* CurrentExecution;
+  if (execution === undefined) return yield* Effect.die(new Error("not inside a task or tool"));
+  return yield* execution.count(name);
+});

@@ -1,8 +1,8 @@
 # Architecture
 
-> **Status (2026-11-25):** principles and invariants only. Component structure, data flow, and
-> the mapping onto Cloudflare resources get added after the M0 spikes confirm decisions D1–D9 in
-> [PLAN.md](PLAN.md). Until then, the "Guiding decisions" table in PLAN.md is the working design.
+> **Status (2026-11-26):** principles, invariants, and what M1, M2, and the API reset built. The
+> rest of the component structure gets added as milestones land. The "Guiding decisions" table in
+> [PLAN.md](PLAN.md) is the working design for what isn't built yet.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
 > The end goal, as code, is in [NORTH-STAR.md](NORTH-STAR.md).
 
@@ -99,16 +99,38 @@ capabilities is planned later (see PLAN.md, "Later").
 - Chat UI and client state sync.
 - Running on providers other than Cloudflare.
 
+## Agents as Rpc groups (the API reset, 2026-11-26)
+
+**Contract.** An agent's contract is a list of `effect/rpc` `Rpc`s: `Agent.make("Greeter", [Greet,
+Ping])`. Each Rpc's `payload`, `success`, and `error` schemas type every call site (principle 9),
+and the wire format is `Schema.toCodecJson` of them. `primaryKey` gives a deterministic task id
+(`<tag>:<key>`), so sending the same key twice records one task. A per-task retry policy is an
+annotation: `.annotate(Agent.Retry, { delay: "30 seconds" })`.
+
+**Hosting.** `X.toLayer(X.of({ … }), { retry, toolkit, limits })` returns a Layer that declares the
+agent's Durable Object (Alchemy's declaration form, `DurableObject<Self, Shape>()(type).make(…)`)
+in the Worker that provides it. The Layer's requirements are the handlers' requirements, minus the
+services the framework provides (`AgentContext`, generation), plus `LanguageModel` and the
+toolkit's handlers if the agent has tools. `Layer.provide` supplies those. The toolkit is an
+option on the agent, not on each call: a turn outlives the execution that started it, so the
+tools have to be known whenever the Durable Object wakes.
+
+**Errors.** A handler's declared errors (the Rpc's `error` schema) settle the task permanently and
+reach the caller as themselves, so `catchTag` works across agents. Everything else the platform
+reports is one `AgentError { agent, reason }`, where the reason is a tagged union: `Unreachable`,
+`ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`,
+`WaitingInHandler`. An undeclared failure is retried up to the attempt cap.
+
 ## The inbox (implemented in M1)
 
 **Storage.** Each agent is one Durable Object instance, and its inbox is the SQLite table
 `alchemy_agent_inbox` inside it. A row holds `task_id` (unique), `task`, the encoded `input`,
-`status`, `attempts`, `max_attempts`, `run_at`, `result`, `error`, `causation`, and timestamps.
-`alchemy_agent_meta` holds the drain cursor, and `alchemy_agent_schema` holds the schema version.
+`status` (`pending` / `running` / `waiting` / `completed` / `failed`), `attempts`, `max_attempts`, `run_at`, `result`, `error`, `causation`, and timestamps.
+`alchemy_agent_meta` holds the drain and step cursors, and `alchemy_agent_schema` holds the schema version.
 Alchemy's own job table holds the one pending `drain` callback.
 
-**Creating a task.** `enqueue` runs in one `storage.transaction`. It decodes the input
-(an unknown task or invalid input is stored as `failed` right away), inserts the row (an existing
+**Creating a task.** `enqueue` runs in one `storage.transaction`. It decodes the payload
+(an unknown task or an invalid payload is stored as `failed` right away), inserts the row (an existing
 task id is left untouched), and schedules the `drain` callback for now. A write and the scheduling
 of its follow-up commit together.
 
@@ -117,8 +139,10 @@ of its follow-up commit together.
    lost attempt (`ExecutionLost`): back to `pending` with a backoff, or `failed` at the cap.
 2. Up to 10 due rows, FIFO. For each: mark `running` and increment `attempts` (committed
    before the handler runs), run the handler, then commit one of: `completed` with the result,
-   `failed` (a `PermanentError`, an unknown task, invalid input, or the attempt cap), or `pending`
-   with `run_at = now + delay × 2^(attempts−1)`.
+   `failed` (a declared error, a failed generation, or the attempt cap), `waiting` (the handler
+   reached an unfinished LLM turn), or `pending` with `run_at = now + delay × 2^(attempts−1)`.
+   The policy is the defaults, then the agent's `retry`, then the task's `Agent.Retry`
+   annotation.
 3. If any row is still pending, reschedule the drain at the earliest `run_at`, passing an
    increasing cursor as `progress`. Without it, Alchemy counts each reschedule as a retry.
 
@@ -126,14 +150,16 @@ The drain never fails because of agent code. Handler failures are recorded in th
 inbox, not Alchemy, decides about retries, and every task settles. Alchemy retries the drain
 callback itself only when the execution dies (for example, the CPU limit), and step 1 recovers.
 
-**Callers.** `Greeter.named("a")` is a typed reference. `ref.greet(input)` sends and waits;
-`ref.send.greet(input)` returns a handle. How the reference reaches the agent comes from the
-context, as a `Reach<"Greeter">` service:
-- in a Worker, `Agent.connect(...)` (Durable Object bindings)
-- inside a handler, the framework, for the agents in `uses`
-- outside Cloudflare, `Api.connect(...)` (the HTTP API, mounted with `Api.routes`)
+**Callers.** `(yield* Greeter.client)("a").Greet(payload)` sends and waits for the answer;
+`{ discard: true }` only sends. How the client reaches the agent comes from the `Agents`
+reference:
+- by default, inside Cloudflare, the Durable Object binding, resolved from the Worker's
+  environment at call time (so any Worker that hosts the agent can call it, handlers included)
+- outside Cloudflare, `Api.connect({ url, token })` replaces it with the HTTP API (mounted with
+  `Api.routes`)
 
-Waiting is a separate capability (`Waiter`) that handlers don't have until M3. Waiting happens
+A send from inside a handler records the sender's task id as the causation. Waiting inside a
+handler fails with `AgentError` (`WaitingInHandler`) until M3. Waiting happens
 inside the Durable Object: a `wait` RPC parks on an in-memory waiter released when the settling
 transaction commits, and returns after 20 s at most. Callers loop, so an eviction only costs a
 re-read.
@@ -147,12 +173,13 @@ missing. (`wait` falls back to reading the record.)
 
 **Storage.** Two more tables in the agent's Durable Object. `alchemy_agent_turns` holds one row
 per prompt: status `queued` / `running` / `completed` / `failed`, the message, the output schema,
-step, error and token counters, and the output. `alchemy_agent_transcript` holds one row per
+the system prompt, step, error and token counters, and the output. `alchemy_agent_transcript` holds one row per
 message (`user`, `model`, `tool_result`) per session, encoded with Effect AI's `Prompt.Message`
 schema.
 
-**A prompt.** `Agent.prompt(message, { session?, output? })` inside a handler looks up turn
-`<taskId>#<n>`. A finished turn returns its answer. Otherwise, in one transaction, the turn is
+**A generation.** `Agent.generate({ prompt, system?, session?, schema? })` inside a handler looks
+up turn `<taskId>#<n>`. A finished turn returns its answer, decoded with the schema (default
+`Schema.String`). Otherwise, in one transaction, the turn is
 recorded and started if its session is free (the user message is appended and the first step
 scheduled). The handler then suspends (a defect, so handler error handling can't swallow it),
 and the task becomes `waiting`.
@@ -163,6 +190,13 @@ and the task becomes `waiting`.
 - One tool call, persisted as a `tool_result` row. Invalid arguments and typed tool failures
   become failed results the model sees.
 - Settling the turn: its text, or a valid `respond` call.
+
+How the model answers depends on the schema. If its encoded form is a string, the model answers in
+text, which the schema decodes. Anything else goes through a `respond` tool built from the
+schema's JSON Schema. An answer that doesn't decode goes back to the model with the error, inside
+the same turn. The schema itself is kept in memory to validate. After an eviction, the JSON
+Schema document stored with the turn validates instead. The step cap and the token budget end a
+turn with `GenerationError` (`StepLimit` / `TokenBudget`).
 
 Each step schedules the next with `progress` from one counter for the whole Durable Object,
 because Alchemy compares a new job's progress with the scheduling job's, even across job ids.
