@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (2026-11-26):** principles, invariants, and what M1, M2, and the API reset built. The
+> **Status (2026-11-26):** principles, invariants, and what M1–M4 and the API reset built. The
 > rest of the component structure gets added as milestones land. The "Guiding decisions" table in
 > [PLAN.md](PLAN.md) is the working design for what isn't built yet.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
@@ -118,7 +118,8 @@ tools have to be known whenever the Durable Object wakes.
 **Errors.** A handler's declared errors (the Rpc's `error` schema) settle the task permanently and
 reach the caller as themselves, so `catchTag` works across agents. Everything else the platform
 reports is one `AgentError { agent, reason }`, where the reason is a tagged union: `Unreachable`,
-`ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`. (Records
+`ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`,
+`FsDenied` (an undeclared workspace denial, never retried). (Records
 from before M3 can also carry `WaitingInHandler`, which nothing produces any more.) An undeclared
 failure is retried up to the attempt cap.
 
@@ -213,6 +214,42 @@ afterwards.
 Lifecycle logs: `task.settled` and `message.sent` carry the causation. They go to Workers Logs.
 
 Not done yet: wait timeouts, and a per-agent allowlist of who may call whom.
+
+## The workspace (implemented in M4)
+
+**Hosting.** `Workspace.layer({ grants })` declares one more Durable Object class,
+`AgentWorkspace`, and an R2 bucket, `AgentWorkspaceFiles`, in the Worker that provides it (next
+to the agents). Only the workspace object binds the bucket. One instance, `workspace`, serves
+everyone.
+
+**Storage.** The object's SQLite holds `alchemy_workspace_grants` (`grantee`, `path`, `access`,
+`granted_by`) and `alchemy_workspace_audit` (every decision: caller, op, path, allowed, reason, and
+the task id and attempt that asked). R2 holds file contents under their logical path.
+
+**Paths** (`internal/paths.ts`, pure). `~/x` expands to `agents/<type>/<name>/x`. `.` and `..` are
+resolved before any check. Absolute paths, escapes, the root, and anything outside `agents/` and
+`shared/` are rejected (and audited as denials).
+
+**Decisions.** The platform (the HTTP API) may do anything. An owner may do anything in its home.
+Otherwise the most specific grant covering the path decides; a grant on `p` covers `p` and
+`p/…`, never a sibling such as `p2`. Only an owner shares or revokes, and only inside its home,
+so shares can't be passed on and only declared grants reach `shared/`. Declared grants are
+replaced on every activation (`granted_by = 'platform'`); agents' shares are left alone.
+
+**An operation** is one RPC from framework code in the calling agent's Durable Object. The
+caller's address comes from `AgentContext`, never from agent code. The object normalizes, decides,
+and writes the audit row in one transaction, then touches R2. Results cross the RPC as data, and
+the client turns a denial into `FsDenied` and a missing file into `FileNotFound`. A write returns a
+`FileRef` whose `revision` is R2's etag.
+
+**Denials are permanent.** A declared `FsDenied` settles the task and reaches the caller as
+itself. An undeclared one settles it with `AgentError(reason: FsDenied)`, without retries. In a
+turn, the workspace tools (`Workspace.Toolkit`) use `failureMode: "return"`: the model sees the
+typed failure and can carry on.
+
+**Reruns.** Code before a waiting call can run more than once, so its workspace operations can
+repeat. Writes overwrite and shares upsert, so the state is the same; the audit can show the
+repeat, with the same task id.
 
 ## LLM turns (implemented in M2)
 

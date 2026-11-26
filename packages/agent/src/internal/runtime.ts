@@ -23,6 +23,7 @@ import {
   Calls,
   CurrentExecution,
   ExecutionLost,
+  FsDenied,
   GenerationError,
   GenerationFailed,
   Generating,
@@ -272,6 +273,8 @@ export const agentObject = (config: HostConfig) => {
               ),
             } as Outcome;
           }
+          // A workspace denial fails the same way on every rerun (grants don't change on retry).
+          if ((e as object) instanceof FsDenied) return { _tag: "Failed", permanent: true, error: agentFailure(e as FsDenied) } as Outcome;
           return { _tag: "Failed", permanent: false, error: { kind: "attempt", message: messageOf(e) } } as Outcome;
         }
         const defect = Cause.findDefect(exit.cause);

@@ -284,8 +284,8 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-As of 2026-11-26 the API reset and M3 are done, and the library has the shape above for what M1
-to M3 cover:
+As of 2026-11-26 the API reset, M3, and M4 are done, and the library has the shape above for
+what M1 to M4 cover:
 
 - `Rpc` contracts and `Agent.make(type, [rpcs])`
 - `X.of` and `X.toLayer(impl, { retry, toolkit, limits })`
@@ -294,14 +294,17 @@ to M3 cover:
 - declared errors, `primaryKey`, and the per-task `Agent.Retry` annotation
 - `Agent.generate` with a schema, the model as a Layer, and the toolkit's handlers as a Layer
 - `Schema.TaggedError` throughout, with `AgentError` carrying a tagged reason
+- `Workspace.read` / `write` / `copy` / `share` / `revision`, `Workspace.FileRef`,
+  `Workspace.FsDenied`, `Workspace.Toolkit` + `Workspace.ToolkitLayer`, and `Grant.read` /
+  `Grant.write`. The grants are declared on `Workspace.layer({ grants })` until `Platform.make`
+  exists.
 
 The Hello and support desk examples are written this way.
 
 Not yet:
 
 - **Wait timeouts and a per-agent allowlist** of who may call whom (left out of M3).
-- **The rest:** the workspace (M4), workflows (M5), listeners (M6), human requests (M7), and
-  `Platform.make`.
+- **The rest:** workflows (M5), listeners (M6), human requests (M7), and `Platform.make`.
 - **`HttpApi`.** The HTTP API is still routed by hand and doesn't use it.
 
 ## What is invented beyond the plan

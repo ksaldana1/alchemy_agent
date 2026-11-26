@@ -7,12 +7,13 @@ import * as Layer from "effect/Layer";
 import * as Api from "../../src/Api.ts";
 import { Echo, EchoLive, Flaky, FlakyLive, Relay, RelayLive } from "./agents.ts";
 import { Desk, DeskLive } from "./llm.ts";
+import { Filer, Librarian, WorkspaceAgentsLive } from "./workspace.ts";
 
 export default Cloudflare.Worker(
   "AgentTestApi",
   { main: import.meta.url },
   Effect.gen(function* () {
-    const api = yield* Api.routes([Echo, Flaky, Relay, Desk]);
+    const api = yield* Api.routes([Echo, Flaky, Relay, Desk, Filer, Librarian]);
     const echoes = yield* Echo.client;
     return {
       fetch: Effect.gen(function* () {
@@ -30,5 +31,5 @@ export default Cloudflare.Worker(
         Effect.catchTag("AgentError", (e) => Effect.succeed(HttpServerResponse.text(e.message, { status: 503 }))),
       ),
     };
-  }).pipe(Effect.provide(Layer.mergeAll(EchoLive, FlakyLive, RelayLive, DeskLive))),
+  }).pipe(Effect.provide(Layer.mergeAll(EchoLive, FlakyLive, RelayLive, DeskLive, WorkspaceAgentsLive))),
 );

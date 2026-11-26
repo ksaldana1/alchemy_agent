@@ -4,12 +4,13 @@
 //   bun run support:demo <url> events <session>        the session's SSE stream
 //   bun run support:demo <url> redeploy-start          starts a turn whose tool takes ~15 s
 //   bun run support:demo <url> redeploy-finish <ref>   waits for it after a redeploy
+//   bun run support:demo <url> workspace               M4: the scribe summarizes a shared doc and shares it
 // The token comes from AGENT_API_TOKEN (examples/support-desk/.env).
 import { Api } from "alchemy-agent";
 import * as Effect from "effect/Effect";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as Schedule from "effect/Schedule";
-import { Helpdesk, Responder, Triage } from "../src/contracts.ts";
+import { Helpdesk, Reader, Responder, Scribe, Triage } from "../src/contracts.ts";
 
 const [url, step, ...rest] = process.argv.slice(2);
 const token = process.env[Api.TOKEN_ENV];
@@ -26,6 +27,17 @@ const TICKETS: Record<string, string> = {
   chargeback: "This is the third time your service went down. If I don't hear back today I'm filing a chargeback and talking to my lawyer.",
   "leaked-key": "My integration fails with 401. Here's my key so you can test: sk-live-9f8a7b6c5d4e3f2a1b0c. What am I doing wrong?",
 };
+
+const POLICY = `# Refund policy
+
+Customers on monthly plans can request a full refund within 14 days of a charge. Annual plans are
+refunded pro rata for unused full months. Duplicate charges are always refunded in full, within 5
+business days. Refunds go back to the original payment method; we never refund to a different card.`;
+
+const put = (path: string, body: string) =>
+  Effect.promise(() =>
+    fetch(`${url}${path}`, { method: "PUT", body, headers: { authorization: `Bearer ${token}` } }).then((r) => r.text()),
+  );
 
 const get = (path: string) =>
   Effect.promise(() => fetch(`${url}${path}`, { headers: { authorization: `Bearer ${token}` } }).then((r) => r.text()));
@@ -93,6 +105,19 @@ const program = Effect.gen(function* () {
     yield* get(`/agents/Helpdesk/front/sessions/${session}/events`);
     console.log("the turn finished after the redeploy. steps:");
     printSteps(JSON.parse(yield* get(`/agents/Helpdesk/front/sessions/${session}`)));
+  } else if (step === "workspace") {
+    // The platform puts a doc in the shared area; only Scribe/kb has a grant on shared/kb/.
+    const doc = `shared/kb/${run}/refund-policy.md`;
+    console.log("platform wrote", yield* put(`/workspace/files/${doc}`, POLICY));
+    const t0 = Date.now();
+    const summary = yield* (yield* Scribe.client)("kb").Summarize({ path: doc, shareWith: Reader.address("billing") });
+    console.log(`Scribe/kb wrote and shared (${Date.now() - t0} ms):`, summary);
+    const readers = yield* Reader.client;
+    console.log("Reader/billing reads it:\n ", yield* readers("billing").ReadFile({ path: summary.path }));
+    const denied = yield* Effect.flip(readers("intruder").ReadFile({ path: summary.path }));
+    console.log("Reader/intruder:", denied._tag, "-", denied.message);
+    const audit = JSON.parse(yield* get("/workspace/audit")) as Array<Record<string, unknown>>;
+    console.log("audited denial:", audit.filter((e) => e.caller === "Reader/intruder").at(-1));
   }
 });
 

@@ -52,6 +52,16 @@ export class WaitingInHandler extends Schema.TaggedError<WaitingInHandler>()("Wa
   message: Schema.String,
 }) {}
 
+/**
+ * The workspace refused an operation (M4). Grants don't change on retry, so it's permanent: a
+ * task that doesn't declare it fails with `AgentError(reason: FsDenied)` instead of retrying.
+ */
+export class FsDenied extends Schema.TaggedError<FsDenied>()("FsDenied", {
+  op: Schema.String,
+  path: Schema.String,
+  message: Schema.String,
+}) {}
+
 export const AgentErrorReason = Schema.Union([
   Unreachable,
   ExecutionLost,
@@ -60,6 +70,7 @@ export const AgentErrorReason = Schema.Union([
   UnknownTask,
   GenerationFailed,
   WaitingInHandler,
+  FsDenied,
 ]);
 
 /**

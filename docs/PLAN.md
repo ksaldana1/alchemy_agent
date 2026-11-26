@@ -39,7 +39,7 @@ when you do.
 | D5 | LLM | Effect AI `LanguageModel` and `Toolkit`. The provider is a Layer: Workers AI by default (no keys), AI Gateway for Anthropic/OpenAI. Tests use a **scripted mock LanguageModel** layer, so they are deterministic. |
 | D6 | Agent loop durability | An LLM turn is a **checkpointed state machine**. Each model call and each tool call is a persisted step in the session transcript. The next step is scheduled by a durable callback. A redeploy or eviction resumes from the last checkpoint and never re-runs the whole turn. |
 | D7 | Waiting | Waiting on another agent, a person, or a timer **suspends** the session (status `waiting`) and releases the DO. The reply arrives as a new inbox item that resumes it. The transcript is the continuation, so no JS stack has to be resumed. |
-| D8 | Files | R2 holds file contents. Grants live in D1. The framework checks the grant inside the caller's DO before touching R2. |
+| D8 | Files | R2 holds file contents. Grants and the audit live in one `AgentWorkspace` Durable Object (changed from D1 on 2026-11-26; see M4), which checks the grant and then touches R2. |
 | D9 | Workflows | Pick in M0.4: native `Cloudflare.Workflow` vs `effect/workflow` on `layerDurableObjectEngine`. The public `AgentWorkflow` API is the same either way. |
 
 ## Repo layout (Bun workspace)
@@ -278,6 +278,54 @@ Changes from the plan above, and why:
 
 **Deployed check:** an LLM agent reads a shared doc, writes `~/summary.md`, and shares it with a
 second agent, which can read it. A third agent is denied, and the denial is audited.
+
+**Design (decided 2026-11-26, before starting M4):**
+- **Grants live in one `AgentWorkspace` Durable Object, not D1 (D8 changes).** Its SQLite holds
+  `grants` and `audit`, so a check and its audit row commit together, and a revoke can't race a
+  read. It also does the R2 operation after the check, so the bucket is bound to it alone. Why not
+  D1: Alchemy's D1 client turns SQL errors into defects (we never catch those), its migrations only
+  read a directory (the `SqlMigrations` problem again), and a single D1 database is just as much a
+  single writer. One instance named `workspace` for now; sharding by owner can come later if it
+  becomes a bottleneck.
+- **The library declares the infrastructure.** `Workspace.layer({ grants })` declares the
+  `AgentWorkspace` Durable Object and the R2 bucket (`AgentWorkspaceFiles`) in the Worker that
+  provides it, next to the agents. Agent code never names either one.
+- **Identity:** the `Workspace` service reads the caller's address from `AgentContext` (framework
+  code in the agent's Durable Object) and passes it on the RPC. Agent code never supplies it.
+- **Platform grants are declared:** `Workspace.layer({ grants: [Grant.read(Editor.address("desk"), "shared/desk/")] })`.
+  They are seeded when the Durable Object activates: added, updated, and removed if no longer
+  declared. Shares made by agents aren't affected. `Platform.make({ grants })` absorbs this later.
+  The HTTP API gets platform file routes (`PUT`/`GET /workspace/files/shared/...` and
+  `GET /workspace/audit`), so scripts can upload a shared doc and inspect decisions.
+- **`FsDenied` is always permanent.** If the Rpc declares it, it reaches the caller as itself
+  (the north star's `catchTag("FsDenied")`). Otherwise the task fails with
+  `AgentError(reason: FsDenied)`. It's added to `AgentErrorReason` and never retried.
+- **Writes return `Workspace.FileRef`** (`{ path, revision, size }`, where `revision` is the R2
+  etag). `Workspace.revision(path)` reads it, which prepares M7's revision-bound approvals.
+- **Audit rows can repeat on a rerun.** Code before a waiting call can run more than once. The
+  audit is a log, not state, and each row carries the task id and attempt, so repeats can be told
+  apart. Writes overwrite, and `share` is an upsert, so repeating them changes nothing.
+- **Still deferred:** the per-agent allowlist of who may call whom. It's about messages, not
+  files, so it moves to `Platform.make`.
+
+**Status (2026-11-26): done.** Library: `Workspace.ts` (operations, `FileRef`, `FsDenied`,
+`FileNotFound`, `Toolkit` / `ToolkitLayer`, `layer`), `Grant.ts`, `internal/paths.ts` (paths and
+decisions, pure), `internal/workspace.ts` (the Durable Object), workspace routes in `Api.ts`
+(`/workspace/files|list|audit`), and `FsDenied` as an `AgentError` reason. Tests:
+`test/paths.test.ts` (12, pure) and `test/workspace.test.ts` (10, local and on `test_$USER`),
+which port both halves of `mini-agent-runtime/tests/filesystem.test.ts` (not the symlink case:
+R2 has no links). Deployed check on `dev_$USER`: `bun run support:demo <url> workspace`. The
+support desk's Scribe (Llama 3.3, workspace tools) reads `shared/kb/…`, writes `~/summary.md`,
+and its handler shares it with `Reader/billing`, which reads it; `Reader/intruder` gets
+`FsDenied`, and the denial is in the audit.
+
+Changes from the design above, and why:
+- **The Scribe's handler shares the summary, not the model.** `share_file` is in the toolkit
+  (and tested with the scripted model), but sharing is a decision the handler can make
+  deterministically, as the north star's Editor does with its `Share` task.
+- **Tool denials are returned, not raised** (`failureMode: "return"`): the model sees
+  `_tag: "FsDenied"` and the reason, instead of only a message.
+- **`FileNotFound` is retryable** (a file may appear later), unlike `FsDenied`.
 
 ## M5: Workflows
 

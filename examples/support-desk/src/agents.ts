@@ -1,11 +1,11 @@
 // The support desk's implementations.
-import { Agent, AgentModel } from "alchemy-agent";
+import { Agent, AgentModel, Grant, Workspace } from "alchemy-agent";
 import * as Tool from "effect/ai/Tool";
 import * as Toolkit from "effect/ai/Toolkit";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { Helpdesk, Responder, Triage, TriageResult } from "./contracts.ts";
+import { Helpdesk, Reader, Responder, Scribe, Triage, TriageResult } from "./contracts.ts";
 
 const Model = AgentModel.workersAI("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
 
@@ -92,3 +92,29 @@ export const HelpdeskLive = Helpdesk.toLayer(
   }),
   { toolkit: Tools },
 ).pipe(Layer.provide([Model, ToolsLive]));
+
+// ---------------------------------------------------------------------------
+// The workspace (M4): the knowledge base is in the shared area; only the scribe may read it.
+// ---------------------------------------------------------------------------
+
+export const WorkspaceLive = Workspace.layer({ grants: [Grant.read(Scribe.address("kb"), "shared/kb/")], forceDestroy: true });
+
+export const ScribeLive = Scribe.toLayer(
+  Scribe.of({
+    Summarize: Effect.fn("Scribe.Summarize")(function* ({ payload: { path, shareWith } }) {
+      yield* Agent.generate({
+        system:
+          "You maintain a support knowledge base. Use the tools: read files with read_file and save files with write_file. " +
+          "Paths starting with ~/ are your own files.",
+        prompt: `Read ${path}, then save a summary of it in at most three sentences to ~/summary.md. Reply "done" once it is saved.`,
+      });
+      // The model wrote the file through its tools; the handler shares it (only an owner can).
+      const summary = yield* Workspace.stat("~/summary.md");
+      yield* Workspace.share(summary.path, shareWith, "read");
+      return summary;
+    }),
+  }),
+  { toolkit: Workspace.Toolkit },
+).pipe(Layer.provide([Model, Workspace.ToolkitLayer]));
+
+export const ReaderLive = Reader.toLayer(Reader.of({ ReadFile: ({ payload }) => Workspace.read(payload.path) }));

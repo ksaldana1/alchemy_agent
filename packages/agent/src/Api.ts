@@ -6,6 +6,12 @@
 //   GET  {prefix}/:type/:name/sessions/:id/events [?after=<seq>]           → SSE: the transcript, then
 //        new messages and turn changes until the session is idle; reconnect with ?after=<last seq>
 //
+//   GET  /workspace/files/<path>                  → the file's text | 404
+//   PUT  /workspace/files/<path>   (text body)    → FileRef
+//   GET  /workspace/list/<path>                   → names (directories end with /)
+//   GET  /workspace/audit          [?after=<seq>] → audit entries (every allow and deny)
+// The workspace routes act as the platform (full access); they need `Workspace.layer()` hosted.
+//
 // `?wait=1` holds the request until the task settles (up to 20 s), then returns the record.
 // Every request needs `Authorization: Bearer <AGENT_API_TOKEN>`.
 import * as Config from "effect/Config";
@@ -27,6 +33,7 @@ import { bindingTransport, stubFor } from "./internal/client.ts";
 import { AgentError, Agents, Unreachable, type Address, type Transport } from "./internal/core.ts";
 import { TaskRecord } from "./internal/inbox.ts";
 import type { SessionEvent } from "./internal/session.ts";
+import * as Workspace from "./Workspace.ts";
 
 /** The env var (bound as a Worker secret) holding the API's bearer token. */
 export const TOKEN_ENV = "AGENT_API_TOKEN";
@@ -70,10 +77,12 @@ export const routes = (agents: ReadonlyArray<{ readonly type: string }>, options
     const handle = Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest;
       const url = new URL(request.url, "http://local");
-      if (!url.pathname.startsWith(`${prefix}/`)) return undefined;
+      const isWorkspace = url.pathname.startsWith("/workspace/");
+      if (!url.pathname.startsWith(`${prefix}/`) && !isWorkspace) return undefined;
       if (!timingSafeEqual(request.headers["authorization"] ?? "", `Bearer ${Redacted.value(token)}`)) {
         return yield* json({ error: "unauthorized" }, 401);
       }
+      if (isWorkspace) return yield* workspaceRoute(request, url);
       const rest = url.pathname.slice(prefix.length);
       const after = Number(url.searchParams.get("after") ?? 0) || 0;
 
@@ -135,6 +144,31 @@ export const routes = (agents: ReadonlyArray<{ readonly type: string }>, options
 
     return { handle } satisfies Routes;
   });
+
+/** The platform's view of the workspace. Denials (a bad path) are 403, a missing file 404. */
+const workspaceRoute = (request: HttpServerRequest.HttpServerRequest, url: URL) =>
+  Effect.gen(function* () {
+    const m = url.pathname.match(/^\/workspace\/(files|list|audit)(?:\/(.*))?$/);
+    if (!m) return yield* json({ error: "not found" }, 404);
+    const path = decodeURIComponent(m[2] ?? "");
+    if (m[1] === "audit" && request.method === "GET") {
+      return yield* json(yield* Workspace.platformOps.audit(Number(url.searchParams.get("after") ?? 0) || 0));
+    }
+    if (m[1] === "list" && request.method === "GET") return yield* json(yield* Workspace.platformOps.list(path));
+    if (m[1] === "files" && request.method === "GET") {
+      return HttpServerResponse.text(yield* Workspace.platformOps.read(path).pipe(Effect.map((r) => r.text)));
+    }
+    if (m[1] === "files" && request.method === "PUT") {
+      const text = yield* request.text.pipe(Effect.orDie);
+      return yield* json(yield* Workspace.platformOps.write(path, text));
+    }
+    return yield* json({ error: "method not allowed" }, 405);
+  }).pipe(
+    Effect.catchTags({
+      FsDenied: (e) => json({ error: "FsDenied", message: e.message }, 403),
+      FileNotFound: (e) => json({ error: "not found", path: e.path }, 404),
+    }),
+  );
 
 /**
  * From outside Cloudflare (a script, a test): reach agents over the HTTP API. Every client
