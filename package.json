@@ -27,7 +27,10 @@
     "support:deploy": "bun --cwd examples/support-desk --bun alchemy deploy --stage dev_$USER",
     "support:plan": "bun --cwd examples/support-desk --bun alchemy plan --stage dev_$USER",
     "support:destroy": "bun --cwd examples/support-desk --bun alchemy destroy --stage dev_$USER",
-    "support:demo": "bun --cwd examples/support-desk scripts/demo.ts"
+    "support:demo": "bun --cwd examples/support-desk scripts/demo.ts",
+    "newsroom:deploy": "bun --cwd examples/newsroom --bun alchemy deploy --stage dev_$USER",
+    "newsroom:destroy": "bun --cwd examples/newsroom --bun alchemy destroy --stage dev_$USER",
+    "newsroom:demo": "bun --cwd examples/newsroom scripts/demo.ts"
   },
   "devDependencies": {
     "@alchemy.run/test": "2.0.0-beta.87",

@@ -21,7 +21,8 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   example: `bun run hello:dev|deploy|plan|destroy|check`. It needs `AGENT_API_TOKEN` in
   `examples/hello/.env`, which is gitignored. The support desk (LLM agents on Workers AI):
   `bun run support:deploy|plan|destroy|demo`, with the same token in `examples/support-desk/.env`.
-  `support:demo <url> workspace` is M4's deployed check (the workspace and its audit).
+  `support:demo <url> workspace` is M4's deployed check (the workspace and its audit). The
+  newsroom (M5, workflows): `bun run newsroom:deploy|destroy|demo`, token in `examples/newsroom/.env`.
 - `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
   replaces the live Worker with a local one.
 - The public API follows `effect/cluster`'s `Entity`: `Rpc` contracts in `Agent.make(type, [rpcs])`,
@@ -33,6 +34,10 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   run, and code before a waiting call can run more than once. Don't catch defects
   (`catchCause`, `catchDefect`, `exit`) around client calls or `Agent.generate`: waiting is a
   defect the runtime has to see.
+- Workflows are plain `effect/workflow` on Alchemy's Durable Object engine (D9). `Workflow.make(name, options)`
+  takes the name first in Effect 4.1. Call agents from the workflow body, never inside an `Activity`.
+  Host agents and workflows together with `Platform.layer` / `Platform.make`, which gives the engine
+  to the agents (otherwise their replies can't reach a waiting run).
 - No formatter is configured. Lines go up to about 140 columns. Don't run `prettier` with its
   defaults (80 columns).
 - A class-style `Context.Service` has no `.asEffect()`. Use `yield* Service` or

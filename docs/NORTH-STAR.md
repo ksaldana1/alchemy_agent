@@ -163,23 +163,26 @@ export const PublishArticleLive = PublishArticle.toLayer(
     // A person signs off on exactly this revision. A sign-off for an older revision is rejected.
     yield* Human.approval("sign-off", { artifact: review.path, revision: review.revision, timeout: "2 days" });
 
+    // Intake copies the edited file into the shared area, so it needs to read it too.
+    yield* desk.Share({ path: review.path, with: Intake.address("intake") });
     return yield* intake.Publish({ from: review.path, name });
   }),
 );
 ```
 
-## `alchemy.run.ts`
+## `src/platform.ts` and `alchemy.run.ts`
+
+The platform is its own module because the Worker bundles it: `main` names the module that
+default-exports the Worker.
 
 ```ts
 import { Grant, Listen, Platform } from "alchemy-agent";
-import * as Cloudflare from "@alchemy.run/cloudflare";
-import * as Alchemy from "alchemy";
-import * as Effect from "effect/Effect";
-import { EditorLive, IntakeLive, ReviewerLive } from "./src/agents.ts";
-import { Editor, Intake } from "./src/contracts.ts";
-import { PublishArticle, PublishArticleLive } from "./src/publish.ts";
+import { EditorLive, IntakeLive, ReviewerLive } from "./agents.ts";
+import { Editor, Intake } from "./contracts.ts";
+import { PublishArticle, PublishArticleLive } from "./publish.ts";
 
-export const Newsroom = Platform.make("Newsroom", {
+export default Platform.make("Newsroom", {
+  main: import.meta.url,
   agents: [IntakeLive, EditorLive, ReviewerLive],
   workflows: [PublishArticleLive],
   // Only the platform grants access to the shared area. The editor shares its own files per article.
@@ -197,6 +200,14 @@ export const Newsroom = Platform.make("Newsroom", {
     })),
   ],
 });
+```
+
+```ts
+// alchemy.run.ts
+import * as Cloudflare from "@alchemy.run/cloudflare";
+import * as Alchemy from "alchemy";
+import * as Effect from "effect/Effect";
+import Newsroom from "./src/platform.ts";
 
 export default Alchemy.Stack(
   "Newsroom",
@@ -283,8 +294,8 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-As of 2026-11-26 the API reset, M3, and M4 are done, and the library has the shape above for
-what M1 to M4 cover:
+As of 2026-11-26 the API reset and M3 to M5 are done, and the library has the shape above for
+what M1 to M5 cover:
 
 - `Rpc` contracts and `Agent.make(type, [rpcs])`
 - `X.of` and `X.toLayer(impl, { retry, toolkit, limits })`
@@ -295,15 +306,18 @@ what M1 to M4 cover:
 - `Schema.TaggedError` throughout, with `AgentError` carrying a tagged reason
 - `Workspace.read` / `write` / `copy` / `share` / `revision`, `Workspace.FileRef`,
   `Workspace.FsDenied`, `Workspace.Toolkit` + `Workspace.ToolkitLayer`, and `Grant.read` /
-  `Grant.write`. The grants are declared on `Workspace.layer({ grants })` until `Platform.make`
-  exists.
+  `Grant.write`
+- workflows as plain `effect/workflow`, with agent client calls as durable steps, and
+  `Platform.make({ main, agents, workflows, grants })`. `examples/newsroom` is this document's
+  newsroom, minus the listener, with `Signal.await(SignOff, { timeout })` standing in for
+  `Human.approval`.
 
 The Hello and support desk examples are written this way.
 
 Not yet:
 
 - **Wait timeouts and a per-agent allowlist** of who may call whom (left out of M3).
-- **The rest:** workflows (M5), listeners (M6), human requests (M7), and `Platform.make`.
+- **The rest:** listeners (M6), human requests (M7), the run-stream demo client, and `Chaos.*`.
 - **`HttpApi`.** The HTTP API is still routed by hand and doesn't use it.
 
 ## What is invented beyond the plan

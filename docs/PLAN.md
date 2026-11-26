@@ -347,6 +347,39 @@ Changes from the design above, and why:
 - a redeploy mid-wait is survived
 - an approval arriving after a timeout is handled correctly
 
+**Status (2026-11-26): done.** Library: `Platform.ts` (`Platform.layer` / `Platform.make`: agents,
+workflows on the Durable Object engine, the workspace, and the API Worker, with the engine given
+to the agents), `Signal.ts` (`Signal.make`, `Signal.await(signal, { timeout })` failing with
+`SignalTimeout`), workflow routes in `Api.ts` (`/workflows/:name/runs[/:id[/signals/:signal]]`),
+and `internal/workflow.ts` (agent calls in a run, the call-position guard, no agent calls inside
+an `Activity`, the engine registry). Tests: `test/workflow.test.ts` (8, local; 7 on
+`test_$USER`, since the position guard only runs locally). The test Worker is built with
+`Platform.layer`. Demo: `examples/newsroom` (Workers AI), deployed on `dev_$USER`;
+`bun run newsroom:demo <url> publish|approve|status`. All three deployed checks pass:
+- publish: intake → LLM edit → share → two reviews at once (the junior one is denied with
+  `FsDenied` and caught; the senior one approves) → sign-off → publish. Each step runs once.
+- a `--force` redeploy while the run waited for sign-off: the approval resumed it, and the
+  article was published
+- a sign-off window of 20 s with no answer: the run fails with `Rejected(by: "timeout")`, and an
+  approval sent afterwards changes nothing
+
+Changes from the plan above, and why:
+- **No `AgentWorkflow` module.** Workflows are plain `effect/workflow` (`Workflow.make`,
+  `Workflows.layer`, `Activity`, `DurableClock`), and an agent client inside a run is a durable
+  step (0.4). Agent failures are the client's usual errors: declared ones as themselves, the
+  rest as `AgentError`.
+- **`Signal` instead of `waitFor`:** a signal is a typed `DurableDeferred`, sent over
+  `POST …/signals/:name`. The timeout is a durable race. M7's human requests build on it.
+- **`Platform.make` came early** (planned for later), because three things needed central
+  wiring: the engine (agents must have it in their context to reply to runs), the workspace and
+  its grants, and the API. It takes `main` (the module that default-exports the Worker), so the
+  platform lives in its own file and the stack yields it.
+- **The engine stores a defect as `{ name, message }`.** An `AgentError` has no message, so a
+  workflow that lets one become a defect should say why. The newsroom's does.
+- **Unexplained:** one cloud run of "starting the same key twice" ended `Died`, about 12 s after
+  a fresh deploy. Two later cloud runs and 12 simultaneous duplicate starts on a warm stack all
+  completed. The test now prints the whole status, so the defect will show if it happens again.
+
 ## M6: Listeners
 
 - `Listen.r2(bucket, { prefix })` provisions an R2 → `Queues.Subscription` → Queue → consumer, plus a dead-letter queue. The consumer enqueues to an agent task, or starts a workflow, using the R2 event identity as the idempotency key. Declared in `AgentPlatform.make({ listeners })`.

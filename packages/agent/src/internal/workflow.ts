@@ -9,12 +9,14 @@
 //      task had already settled, else null. Stored by the engine, so it runs once per run's life.
 //   2. `DurableDeferred.await(agent-call/c<n>)`: the agent's outbox delivers the reply through
 //      the engine's `deferredDone` (see `signalWorkflow` below, used by `outbox.ts`).
+import { CurrentActivity } from "alchemy/WorkflowEncoding";
 import type * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { Activity, DurableDeferred, WorkflowEngine } from "effect/workflow";
+import { Activity, DurableDeferred, type Workflow, WorkflowEngine } from "effect/workflow";
 import { callAgent } from "./client.ts";
 import { AgentError, type Address, type CallRequest } from "./core.ts";
 import { TaskRecord } from "./inbox.ts";
@@ -25,11 +27,18 @@ export const WORKFLOW_PREFIX = "workflow:";
 /** Calls made so far by one run. A run gets a fresh `WorkflowInstance`, so this restarts with it. */
 const counters = new WeakMap<object, { n: number }>();
 
-/** The workflow run this code is in, if any (and not inside one of its activities). */
+/** The workflow run this code is in, if any. Inside one of its activities, a client call dies. */
 export const currentRun = Effect.gen(function* () {
   const instance = yield* Effect.serviceOption(WorkflowEngine.WorkflowInstance);
   const engine = yield* Effect.serviceOption(WorkflowEngine.WorkflowEngine);
   if (Option.isNone(instance) || Option.isNone(engine)) return undefined;
+  // An activity runs once and its result is journaled: an agent call inside it would be a step
+  // inside a step. Calls belong in the workflow body, where each one is its own step.
+  if (Option.isSome(yield* Effect.serviceOption(CurrentActivity))) {
+    return yield* Effect.die(
+      new Error(`an agent call inside an Activity of ${instance.value.workflow._tag}: call agents from the workflow body, where each call is a durable step`),
+    );
+  }
   return { instance: instance.value, engine: engine.value };
 });
 
@@ -101,3 +110,26 @@ export const signalWorkflow = (
     deferredName,
     exit: Exit.succeed(record),
   });
+
+// ---------------------------------------------------------------------------
+// Hosting: the engine, wrapped to remember which workflows this Worker runs (for the HTTP API)
+// ---------------------------------------------------------------------------
+
+/** Workflows registered with this Worker's engine, by name. */
+export const registry = new Map<string, Workflow.Any>();
+
+/** The engine, recording each workflow that registers with it. */
+export const trackRegistrations = <E, R>(
+  engine: Layer.Layer<WorkflowEngine.WorkflowEngine, E, R>,
+): Layer.Layer<WorkflowEngine.WorkflowEngine, E, R> =>
+  Layer.effect(
+    WorkflowEngine.WorkflowEngine,
+    Effect.map(Effect.service(WorkflowEngine.WorkflowEngine), (inner) => ({
+      ...inner,
+      register: (workflow, execute) =>
+        Effect.andThen(
+          Effect.sync(() => void registry.set(workflow._tag, workflow)),
+          inner.register(workflow, execute),
+        ),
+    })),
+  ).pipe(Layer.provide(engine));

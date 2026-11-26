@@ -195,7 +195,8 @@ One execution of a workflow with a specific input, with its own durable progress
 _Avoid_: Instance, execution, job
 
 **Signal**:
-A named, typed value sent to a waiting workflow run from outside it, such as an approval.
+A named, typed value sent to a waiting workflow run from outside it, such as an approval
+(`Signal.make`, `Signal.await`). The first value sent counts.
 _Avoid_: Event (alone), message, notification
 
 ### People

@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (2026-11-26):** principles, invariants, and what M1–M4 and the API reset built. The
+> **Status (2026-11-26):** principles, invariants, and what M1–M5 and the API reset built. The
 > rest of the component structure gets added as milestones land. The "Guiding decisions" table in
 > [PLAN.md](PLAN.md) is the working design for what isn't built yet.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
@@ -250,6 +250,38 @@ typed failure and can carry on.
 **Reruns.** Code before a waiting call can run more than once, so its workspace operations can
 repeat. Writes overwrite and shares upsert, so the state is the same; the audit can show the
 repeat, with the same task id.
+
+## Workflows (implemented in M5, engine chosen in spike 0.4)
+
+**Code.** A workflow is plain `effect/workflow`: `Workflow.make(name, { payload, success, error,
+idempotencyKey })`, implemented with `Workflows.layer(W, handler)` (Alchemy), using `Activity`,
+`DurableClock.sleep`, and `Signal.await` (a `DurableDeferred`, optionally raced against a durable
+clock). An agent client call in the workflow body is a durable step.
+
+**Engine (D9).** Alchemy's Durable Object engine: one Durable Object class per workflow
+(`<Name>Workflow`), one instance per run, named by its execution id, with the run's journal in its
+SQLite. A run replays from the top on each wake-up: journaled steps return their results, the
+first new one runs, and a wait that isn't ready suspends the run (holding nothing).
+
+**An agent call in a run** (`internal/workflow.ts`). The n-th call is an Activity
+`agent-call/c<n>` that enqueues the task (id `wf/<Workflow>/<executionId>/c<n>`, or the Rpc's
+`primaryKey`) and subscribes with reply-to `workflow:<Workflow>` / `<executionId>` /
+`agent-call/c<n>`. The Activity records which call it made, so a replay that makes a different
+call there dies instead of reusing another call's answer. The run then awaits the
+`DurableDeferred` `agent-call/c<n>`. When the task settles, the agent's outbox delivers the reply
+with the engine's `deferredDone`. That's why the engine must be in the agents' context, which
+`Platform.layer` arranges. An agent call inside an `Activity` dies: calls belong in the workflow
+body.
+
+**Hosting** (`Platform.layer` / `Platform.make`). The agents, the workflows, and the workspace
+are built with the engine provided (`Layer.provideMerge`). The engine is wrapped to record
+which workflows register with it, so the HTTP API can start runs, read them, and signal them by
+name.
+
+**Signals.** `POST /workflows/:name/runs/:id/signals/:signal { value }` completes the run's
+deferred with the encoded value; the run decodes it with its own schema. The first value wins,
+and later ones (or one after the timeout won the race) are ignored. A value sent before the run
+reaches the wait is kept.
 
 ## LLM turns (implemented in M2)
 

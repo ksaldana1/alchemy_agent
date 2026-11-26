@@ -1,4 +1,4 @@
 {
   "files": [],
-  "references": [{ "path": "packages/agent" }, { "path": "examples/hello" }, { "path": "examples/support-desk" }, { "path": "spikes" }]
+  "references": [{ "path": "packages/agent" }, { "path": "examples/hello" }, { "path": "examples/support-desk" }, { "path": "examples/newsroom" }, { "path": "spikes" }]
 }

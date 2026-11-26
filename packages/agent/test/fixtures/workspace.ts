@@ -94,7 +94,3 @@ export const LibrarianLive = Librarian.toLayer(
   }),
   { toolkit: Workspace.Toolkit },
 ).pipe(Layer.provide([AgentModel.scripted(script), Workspace.ToolkitLayer]));
-
-export const WorkspaceLive = Workspace.layer({ grants, forceDestroy: true });
-
-export const WorkspaceAgentsLive = Layer.mergeAll(FilerLive, LibrarianLive, WorkspaceLive);

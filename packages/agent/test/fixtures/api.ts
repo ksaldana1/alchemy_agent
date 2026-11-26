@@ -1,13 +1,15 @@
-// The test Worker: hosts the agents (their Layers) and mounts their API next to a route of its own.
+// The test Worker: hosts the agents, workflows, and workspace (`Platform.layer`), and mounts their API
+// next to a route of its own.
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Effect from "effect/Effect";
 import { HttpServerRequest } from "effect/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
-import * as Layer from "effect/Layer";
 import * as Api from "../../src/Api.ts";
 import { Echo, EchoLive, Flaky, FlakyLive, Relay, RelayLive } from "./agents.ts";
 import { Desk, DeskLive } from "./llm.ts";
-import { Filer, Librarian, WorkspaceAgentsLive } from "./workspace.ts";
+import * as Platform from "../../src/Platform.ts";
+import { workflows } from "./workflows.ts";
+import { Filer, FilerLive, grants, Librarian, LibrarianLive } from "./workspace.ts";
 
 export default Cloudflare.Worker(
   "AgentTestApi",
@@ -31,5 +33,14 @@ export default Cloudflare.Worker(
         Effect.catchTag("AgentError", (e) => Effect.succeed(HttpServerResponse.text(e.message, { status: 503 }))),
       ),
     };
-  }).pipe(Effect.provide(Layer.mergeAll(EchoLive, FlakyLive, RelayLive, DeskLive, WorkspaceAgentsLive))),
+  }).pipe(
+    Effect.provide(
+      Platform.layer({
+        agents: [EchoLive, FlakyLive, RelayLive, DeskLive, FilerLive, LibrarianLive],
+        workflows,
+        grants,
+        workspace: { forceDestroy: true },
+      }),
+    ),
+  ),
 );
