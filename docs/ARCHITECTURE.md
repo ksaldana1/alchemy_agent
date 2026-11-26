@@ -126,9 +126,22 @@ The drain never fails because of agent code. Handler failures are recorded in th
 inbox, not Alchemy, decides about retries, and every task settles. Alchemy retries the drain
 callback itself only when the execution dies (for example, the CPU limit), and step 1 recovers.
 
-**Callers.** `Agent.lookup(Agent)` in a Worker, `Agent.use(Agent)` in a handler (with `uses`),
-and `Api.client(...)` over HTTP all return the same `AgentClient`, typed from the agent
-definition. `send` returns a `TaskHandle`, whose `result()` polls the record until it settles.
+**Callers.** `Greeter.named("a")` is a typed reference. `ref.greet(input)` sends and waits;
+`ref.send.greet(input)` returns a handle. How the reference reaches the agent comes from the
+context, as a `Reach<"Greeter">` service:
+- in a Worker, `Agent.connect(...)` (Durable Object bindings)
+- inside a handler, the framework, for the agents in `uses`
+- outside Cloudflare, `Api.connect(...)` (the HTTP API, mounted with `Api.routes`)
+
+Waiting is a separate capability (`Waiter`) that handlers don't have until M3. Waiting happens
+inside the Durable Object: a `wait` RPC parks on an in-memory waiter released when the settling
+transaction commits, and returns after 20 s at most. Callers loop, so an eviction only costs a
+re-read.
+
+**Deploys and version skew.** Right after a deploy, a Durable Object instance can still run the
+previous code for a few minutes. Callers must tolerate an instance that is one version behind:
+add RPC methods without removing old ones, and have callers fall back when a new method is
+missing. (`wait` falls back to reading the record.)
 
 ## To be added after M0
 

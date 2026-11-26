@@ -13,19 +13,13 @@ const failOnce = Effect.gen(function* () {
 });
 
 export class Greeter extends Agent.make<Greeter>()("Greeter", {
-  retry: { maxAttempts: 3, delay: "1 second" },
-  tasks: {
-    greet: Agent.task({ input: Schema.Struct({ name: Schema.String }) }, ({ name }) =>
-      Effect.gen(function* () {
-        const ctx = yield* Agent.AgentContext;
-        return { greeting: `Hello, ${name}!`, by: `${ctx.agent.type}/${ctx.agent.name}` };
-      }),
-    ),
-    failOnce: Agent.task({ input: Schema.Struct({}) }, () => failOnce),
-    // Same, but waits 30 s before the retry, so a redeploy can land while it's pending.
-    failOnceSlowly: Agent.task(
-      { input: Schema.Struct({}), retry: { delay: "30 seconds" } },
-      () => failOnce,
-    ),
-  },
+  greet: Agent.task({ name: Schema.String }, ({ name }) =>
+    Effect.map(Effect.service(Agent.AgentContext), (ctx) => ({
+      greeting: `Hello, ${name}!`,
+      by: `${ctx.agent.type}/${ctx.agent.name}`,
+    })),
+  ),
+  failOnce: Agent.task(() => failOnce),
+  // Same, but waits 30 s before the retry, so a redeploy can land while it's pending.
+  failOnceSlowly: Agent.task({}, { retry: { delay: "30 seconds" } }, () => failOnce),
 }) {}

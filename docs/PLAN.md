@@ -140,6 +140,11 @@ Changes from the plan above, and why:
 - **Defaults chosen for the 0.2 open questions:** `RuntimeContext` never appears in user-visible
   types. Outputs without an `output` schema must be plain JSON (a compile error otherwise).
   `result()` hangs off the typed `TaskHandle`.
+- **API pass (after M1, 2026-11-25):** the API moved to the north-star shape. Calls are
+  method-style (`Greeter.named("a").greet(input)` waits; `send.greet` doesn't), and inputs are
+  struct fields. `Agent.connect` / `Api.connect` provide how to reach agents. `Api.routes` is
+  mountable. Waiting happens inside the Durable Object instead of by polling. The scenarios in
+  `inbox.test.ts` carried over (17 now); the deployed checks pass again.
 - **Every task carries a `causation`** (`<Type>/<name>/<taskId>` of the sending task, or null
   from the API). This is a start on the observability invariant.
 

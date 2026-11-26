@@ -26,6 +26,8 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   `Effect.service(Service)`.
 - TypeScript 7 can hide later errors in a file while earlier ones are present. Check each
   `@ts-expect-error` case on its own.
+- After a deploy, a Durable Object can run the previous code for a few minutes. Only add RPC
+  methods, never remove or change them, and make callers fall back if a new one is missing.
 - Deployed Workers freeze `Date.now()` and `performance.now()` during synchronous code. Never
   write a busy loop or a timeout that depends on the clock.
 

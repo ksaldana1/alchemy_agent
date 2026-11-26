@@ -10,7 +10,6 @@ import * as Effect from "effect/Effect";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
-import * as Agent from "../src/Agent.ts";
 import * as Api from "../src/Api.ts";
 import { Echo, Flaky, Relay } from "./fixtures/agents.ts";
 import Stack from "./fixtures/stack.ts";
@@ -28,225 +27,243 @@ afterAll.skipIf(!!process.env.NO_DESTROY)(destroy(Stack));
 
 // Fresh agent names per run: deployed DO storage outlives a run.
 const run = crypto.randomUUID().slice(0, 8);
-const api = Effect.map(stack, ({ url }) => Api.client({ url: url!, token }));
 
-/** The first request to a fresh workers.dev URL can 404 while the edge converges. */
-const ready = Effect.gen(function* () {
-  const { url } = yield* stack;
-  yield* Test.getWhenReady(`${url}/agents/Echo/warmup/tasks/none`);
-});
+/** Runs `effect` with the agents reachable over the deployed stack's HTTP API. */
+const viaApi = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.flatMap(stack, ({ url }) =>
+    effect.pipe(Effect.provide(Api.connect({ url: url!, token }, Echo, Flaky, Relay))),
+  );
 
 const timeout = { timeout: 60_000 };
 
 test(
-  "happy path: a task is recorded pending, runs, and completes with its output",
-  Effect.gen(function* () {
-    yield* ready;
-    const echo = (yield* api).agent(Echo, `a-${run}`);
-    const handle = yield* echo.send("echo", { text: "hi" }, { taskId: "t1" });
-    expect(handle.taskId).toBe("t1");
-    expect(yield* handle.result()).toEqual({ echoed: "HI" });
-    expect(yield* handle.status).toMatchObject({
-      taskId: "t1",
-      task: "echo",
-      status: "completed",
-      attempts: 1,
-      result: { echoed: "HI" },
-    });
-  }),
+  "happy path: a call records the task, runs it, and returns its output",
+  viaApi(
+    Effect.gen(function* () {
+      const { url } = yield* stack;
+      yield* Test.getWhenReady(`${url}/shout/warmup`); // a fresh workers.dev URL can 404 briefly
+      const echo = Echo.named(`a-${run}`);
+      expect(yield* echo.echo({ text: "hi" }, { taskId: "t1" })).toEqual({ echoed: "HI" });
+      expect(yield* echo.handle("echo", "t1").status).toMatchObject({
+        taskId: "t1",
+        task: "echo",
+        status: "completed",
+        attempts: 1,
+        result: { echoed: "HI" },
+      });
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "send returns a handle right away; result waits (inside the DO, across a slow handler)",
+  viaApi(
+    Effect.gen(function* () {
+      const handle = yield* Echo.named(`slow-${run}`).send.slow({ ms: 1500 });
+      expect((yield* handle.status).status).not.toBe("completed");
+      expect(yield* handle.result).toEqual({ slept: 1500 });
+    }),
+  ),
   timeout,
 );
 
 test(
   "AgentContext: type, name, task id, attempt",
-  Effect.gen(function* () {
-    const echo = (yield* api).agent(Echo, `ctx-${run}`);
-    const handle = yield* echo.send("whoami", {}, { taskId: "w1" });
-    expect(yield* handle.result()).toEqual({
-      type: "Echo",
-      name: `ctx-${run}`,
-      taskId: "w1",
-      attempt: 1,
-    });
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      expect(yield* Echo.named(`ctx-${run}`).whoami(undefined, { taskId: "w1" })).toEqual({
+        type: "Echo",
+        name: `ctx-${run}`,
+        taskId: "w1",
+        attempt: 1,
+      });
+    }),
+  ),
   timeout,
 );
 
 test(
   "dedupes by task id per agent; the same id on another agent is a different task",
-  Effect.gen(function* () {
-    const client = yield* api;
-    const a = client.agent(Echo, `dedupe-a-${run}`);
-    const b = client.agent(Echo, `dedupe-b-${run}`);
-    const first = yield* a.send("echo", { text: "one" }, { taskId: "k" });
-    yield* first.result();
-    const dup = yield* a.send("echo", { text: "two" }, { taskId: "k" });
-    const other = yield* b.send("echo", { text: "three" }, { taskId: "k" });
-    // A settled task never runs again, and its outcome never changes.
-    expect(yield* dup.result()).toEqual({ echoed: "ONE" });
-    expect((yield* dup.status).attempts).toBe(1);
-    expect(yield* other.result()).toEqual({ echoed: "THREE" });
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      const a = Echo.named(`dedupe-a-${run}`);
+      expect(yield* a.echo({ text: "one" }, { taskId: "k" })).toEqual({ echoed: "ONE" });
+      // A settled task never runs again, and its outcome never changes.
+      expect(yield* a.echo({ text: "two" }, { taskId: "k" })).toEqual({ echoed: "ONE" });
+      expect((yield* a.handle("echo", "k").status).attempts).toBe(1);
+      expect(yield* Echo.named(`dedupe-b-${run}`).echo({ text: "three" }, { taskId: "k" })).toEqual({
+        echoed: "THREE",
+      });
+    }),
+  ),
   timeout,
 );
 
 test(
   "runs tasks FIFO",
-  Effect.gen(function* () {
-    const echo = (yield* api).agent(Echo, `fifo-${run}`);
-    const handles = [];
-    for (const label of ["first", "second", "third"]) {
-      handles.push(yield* echo.send("order", { label }));
-    }
-    const results = [];
-    for (const h of handles) results.push(yield* h.result());
-    expect(results.map((r) => r.label)).toEqual(["first", "second", "third"]);
-    expect(results[0]!.n < results[1]!.n && results[1]!.n < results[2]!.n).toBe(true);
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      const echo = Echo.named(`fifo-${run}`);
+      const handles = [];
+      for (const label of ["first", "second", "third"]) handles.push(yield* echo.send.order({ label }));
+      const results = [];
+      for (const h of handles) results.push(yield* h.result);
+      expect(results.map((r) => r.label)).toEqual(["first", "second", "third"]);
+      expect(results[0]!.n < results[1]!.n && results[1]!.n < results[2]!.n).toBe(true);
+    }),
+  ),
   timeout,
 );
 
 test(
-  "a retryable failure is redelivered; result() ignores non-final transitions",
-  Effect.gen(function* () {
-    const flaky = (yield* api).agent(Flaky, `retry-${run}`);
-    const handle = yield* flaky.send("flaky", { failTimes: 1 });
-    expect(yield* handle.result()).toEqual({ attempt: 2 });
-    expect(yield* handle.status).toMatchObject({
-      status: "completed",
-      attempts: 2,
-      error: { _tag: "Flake", message: "flake #1" },
-    });
-  }),
+  "a retryable failure is redelivered; waiting ignores non-final transitions",
+  viaApi(
+    Effect.gen(function* () {
+      const flaky = Flaky.named(`retry-${run}`);
+      expect(yield* flaky.flaky({ failTimes: 1 }, { taskId: "f" })).toEqual({ attempt: 2 });
+      expect(yield* flaky.handle("flaky", "f").status).toMatchObject({
+        status: "completed",
+        attempts: 2,
+        error: { _tag: "Flake", message: "flake #1" },
+      });
+    }),
+  ),
   timeout,
 );
 
 test(
   "retries until attempts are exhausted, then fails with the last error",
-  Effect.gen(function* () {
-    const flaky = (yield* api).agent(Flaky, `exhaust-${run}`);
-    const handle = yield* flaky.send("flaky", { failTimes: 10 });
-    const failed = yield* Effect.flip(handle.result());
-    expect(failed).toMatchObject({
-      _tag: "TaskFailed",
-      attempts: 3,
-      error: { _tag: "Flake", message: "flake #3" },
-    });
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      const failed = yield* Effect.flip(Flaky.named(`exhaust-${run}`).flaky({ failTimes: 10 }));
+      expect(failed).toMatchObject({ _tag: "TaskFailed", attempts: 3, error: { _tag: "Flake", message: "flake #3" } });
+    }),
+  ),
   timeout,
 );
 
 test(
   "a PermanentError fails the task on the first attempt",
-  Effect.gen(function* () {
-    const flaky = (yield* api).agent(Flaky, `perm-${run}`);
-    const failed = yield* Effect.flip((yield* flaky.send("permanent", {})).result());
-    expect(failed).toMatchObject({ attempts: 1, error: { _tag: "PermanentError", message: "nope" } });
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      const failed = yield* Effect.flip(Flaky.named(`perm-${run}`).permanent());
+      expect(failed).toMatchObject({ attempts: 1, error: { _tag: "PermanentError", message: "nope" } });
+    }),
+  ),
   timeout,
 );
 
 test(
   "a defect is retried like any other failure",
-  Effect.gen(function* () {
-    const flaky = (yield* api).agent(Flaky, `die-${run}`);
-    const failed = yield* Effect.flip((yield* flaky.send("die", {})).result());
-    expect(failed).toMatchObject({ attempts: 3, error: { _tag: "Defect", message: "boom" } });
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      const failed = yield* Effect.flip(Flaky.named(`die-${run}`).die());
+      expect(failed).toMatchObject({ attempts: 3, error: { _tag: "Defect", message: "boom" } });
+    }),
+  ),
   timeout,
 );
 
 test(
-  "a running task whose execution is lost is redelivered as the next attempt",
-  Effect.gen(function* () {
-    const flaky = (yield* api).agent(Flaky, `crash-${run}`);
-    const handle = yield* flaky.send("crash", { times: 1 });
-    expect(yield* handle.result()).toEqual({ attempt: 2 });
-    expect(yield* handle.status).toMatchObject({
-      attempts: 2,
-      error: { _tag: "ExecutionLost" },
-    });
-  }),
+  "a running task whose execution is lost is redelivered; the caller's wait survives the reset",
+  viaApi(
+    Effect.gen(function* () {
+      const flaky = Flaky.named(`crash-${run}`);
+      expect(yield* flaky.crash({ times: 1 }, { taskId: "c" })).toEqual({ attempt: 2 });
+      expect(yield* flaky.handle("crash", "c").status).toMatchObject({ attempts: 2, error: { _tag: "ExecutionLost" } });
+    }),
+  ),
   timeout,
 );
 
 test(
   "a task that keeps killing its execution ends up failed, not redelivered forever",
-  Effect.gen(function* () {
-    const flaky = (yield* api).agent(Flaky, `crashloop-${run}`);
-    const failed = yield* Effect.flip((yield* flaky.send("crash", { times: 99 })).result());
-    expect(failed).toMatchObject({ attempts: 3, error: { _tag: "ExecutionLost" } });
-  }),
+  viaApi(
+    Effect.gen(function* () {
+      const failed = yield* Effect.flip(Flaky.named(`crashloop-${run}`).crash({ times: 99 }));
+      expect(failed).toMatchObject({ attempts: 3, error: { _tag: "ExecutionLost" } });
+    }),
+  ),
   timeout,
 );
 
 test(
   "an unknown task or invalid input is stored as failed, not thrown",
-  Effect.gen(function* () {
-    const { url } = yield* stack;
-    const post = (body: unknown) =>
-      HttpClient.execute(
-        HttpClientRequest.post(`${url}/agents/Echo/bad-${run}/tasks`).pipe(
-          HttpClientRequest.bearerToken(token),
-          HttpClientRequest.setBody(HttpBody.jsonUnsafe(body)),
-        ),
-      ).pipe(Effect.flatMap((res) => Effect.map(res.json, (json) => ({ status: res.status, json }))));
+  viaApi(
+    Effect.gen(function* () {
+      const { url } = yield* stack;
+      const post = (body: unknown) =>
+        HttpClient.execute(
+          HttpClientRequest.post(`${url}/agents/Echo/bad-${run}/tasks`).pipe(
+            HttpClientRequest.bearerToken(token),
+            HttpClientRequest.setBody(HttpBody.jsonUnsafe(body)),
+          ),
+        ).pipe(Effect.flatMap((res) => Effect.map(res.json, (json) => ({ status: res.status, json }))));
 
-    expect(yield* post({ task: "nope", input: {}, taskId: "u" })).toMatchObject({
-      status: 202,
-      json: { status: "failed", attempts: 0, error: { _tag: "UnknownTaskError" } },
-    });
-    expect(yield* post({ task: "echo", input: { text: 1 }, taskId: "i" })).toMatchObject({
-      status: 202,
-      json: { status: "failed", attempts: 0, error: { _tag: "TaskInputError" } },
-    });
-    // The typed client sees the stored failure through result().
-    const echo = (yield* api).agent(Echo, `bad-${run}`);
-    const failed = yield* Effect.flip(echo.handle("echo", "i").result());
-    expect(failed).toMatchObject({ _tag: "TaskFailed", error: { _tag: "TaskInputError" } });
-  }),
+      expect(yield* post({ task: "nope", input: {}, taskId: "u" })).toMatchObject({
+        status: 202,
+        json: { status: "failed", attempts: 0, error: { _tag: "UnknownTaskError" } },
+      });
+      expect(yield* post({ task: "echo", input: { text: 1 }, taskId: "i" })).toMatchObject({
+        status: 202,
+        json: { status: "failed", attempts: 0, error: { _tag: "TaskInputError" } },
+      });
+      // A reference sees the stored failure when it waits.
+      const failed = yield* Effect.flip(Echo.named(`bad-${run}`).handle("echo", "i").result);
+      expect(failed).toMatchObject({ _tag: "TaskFailed", error: { _tag: "TaskInputError" } });
+    }),
+  ),
   timeout,
 );
 
 test(
-  "result() for an unknown task id fails with TaskNotFound",
-  Effect.gen(function* () {
-    const echo = (yield* api).agent(Echo, `missing-${run}`);
-    const error = yield* Effect.flip(echo.handle("echo", "never-sent").result());
-    expect(error).toMatchObject({ _tag: "TaskNotFound", taskId: "never-sent" });
-  }),
+  "waiting on an unknown task id fails with TaskNotFound",
+  viaApi(
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(Echo.named(`missing-${run}`).handle("echo", "never-sent").result);
+      expect(error).toMatchObject({ _tag: "TaskNotFound", taskId: "never-sent" });
+    }),
+  ),
   timeout,
 );
 
 test(
-  "an output schema stores the encoded form and the client decodes it",
-  Effect.gen(function* () {
-    const { url } = yield* stack;
-    const echo = (yield* api).agent(Echo, `stamp-${run}`);
-    const handle = yield* echo.send("stamp", { epochMs: 0 }, { taskId: "s" });
-    const out = yield* handle.result();
-    expect(out.at).toBeInstanceOf(Date);
-    expect(out.at.getTime()).toBe(0);
-    const raw = yield* HttpClient.execute(
-      HttpClientRequest.get(`${url}/agents/Echo/stamp-${run}/tasks/s`).pipe(
-        HttpClientRequest.bearerToken(token),
-      ),
-    ).pipe(Effect.flatMap((res) => res.json));
-    expect(raw).toMatchObject({ result: { at: "1970-01-01T00:00:00.000Z" } });
-  }),
+  "an output schema stores the encoded form and the reference decodes it",
+  viaApi(
+    Effect.gen(function* () {
+      const { url } = yield* stack;
+      const out = yield* Echo.named(`stamp-${run}`).stamp({ epochMs: 0 }, { taskId: "s" });
+      expect(out.at).toBeInstanceOf(Date);
+      expect(out.at.getTime()).toBe(0);
+      const raw = yield* HttpClient.execute(
+        HttpClientRequest.get(`${url}/agents/Echo/stamp-${run}/tasks/s`).pipe(HttpClientRequest.bearerToken(token)),
+      ).pipe(Effect.flatMap((res) => res.json));
+      expect(raw).toMatchObject({ result: { at: "1970-01-01T00:00:00.000Z" } });
+    }),
+  ),
   timeout,
 );
 
 test(
   "an agent sends to another agent it declared in `uses`, with causation",
+  viaApi(
+    Effect.gen(function* () {
+      expect(yield* Relay.named(`r-${run}`).forward({ text: "via" }, { taskId: "f" })).toEqual({ taskId: "f:echo" });
+      const echoed = Echo.named(`from-r-${run}`).handle("echo", "f:echo");
+      expect(yield* echoed.result).toEqual({ echoed: "VIA" });
+      expect((yield* echoed.status).causation).toBe(`Relay/r-${run}/f`);
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "a Worker's own route calls an agent through a reference (the API is mounted alongside)",
   Effect.gen(function* () {
-    const client = yield* api;
-    const relay = client.agent(Relay, `r-${run}`);
-    const forwarded = yield* (yield* relay.send("forward", { text: "via" }, { taskId: "f" })).result();
-    expect(forwarded).toEqual({ taskId: "f:echo" });
-    const echoed = client.agent(Echo, `from-r-${run}`).handle("echo", "f:echo");
-    expect(yield* echoed.result()).toEqual({ echoed: "VIA" });
-    expect((yield* echoed.status).causation).toBe(`Relay/r-${run}/f`);
+    const { url } = yield* stack;
+    const res = yield* HttpClient.get(`${url}/shout/hello`);
+    expect(yield* res.json).toEqual({ echoed: "HELLO" });
   }),
   timeout,
 );
@@ -267,6 +284,3 @@ test(
   }),
   timeout,
 );
-
-// Keep `Agent` referenced for readers jumping here from the type tests.
-void Agent;

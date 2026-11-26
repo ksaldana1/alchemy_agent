@@ -207,13 +207,19 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-M1's API, as of 2026-11-25, uses `send("task", input)` with string task names, `TaskHandle`s that
-poll, `uses: [X]` plus `Agent.use(X)` to reach other agents, and an `Api.worker` that owns its
-Worker. The planned API pass closes that gap before M2:
-- method-style calls that wait by default, with an explicit `send` for fire-and-forget
-- struct-field task inputs, and tasks with no input
-- a mountable API instead of one that owns the Worker
-- testing hooks moved out of the public module
+As of the API pass (2026-11-25), the shapes in this doc's agent definitions and `Agent.named(...)`
+calls are implemented for task agents:
+- struct-field inputs
+- method-style calls that wait, and `send.<task>`
+- `Agent.connect`, `Api.routes` / `Api.connect`
+- `alchemy-agent/testing`
+
+Still to come:
+- `uses` must still be declared (Alchemy only binds Durable Objects at construction time;
+  `Platform.make` could infer it later)
+- waiting from inside a handler (M3)
+- LLM agents (M2)
+- the workspace (M4), workflows (M5), listeners (M6), human requests (M7), and `Platform.make`
 
 ## What is invented beyond the plan
 
