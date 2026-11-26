@@ -43,6 +43,7 @@ What you get:
 
 ## Contents
 
+- [Core ideas](#core-ideas)
 - [Getting started](#getting-started)
 - [Agents](#agents)
 - [Calling agents](#calling-agents)
@@ -56,6 +57,103 @@ What you get:
 - [Testing](#testing)
 - [Rules to know](#rules-to-know)
 - [Examples](#examples)
+
+---
+
+## Core ideas
+
+A few ideas explain everything else in the library. Each later section builds on these.
+
+### Agents are identities, not processes
+
+An **agent definition** describes a kind of agent: its name and the tasks it accepts
+(`Agent.make("Reviewer", [Review])`). An **agent** is one named identity of that definition, such
+as `Reviewer/junior` or `Reviewer/senior`. An agent exists as soon as something addresses it, and
+it keeps its inbox, its files, and its history whether or not any of its code is running.
+
+The code runs in **executions**: short periods that the platform starts and stops as work
+arrives. Executions are invisible to your code. An agent can be evicted, crash, or be redeployed
+between any two lines, and nothing is lost, because everything that matters is recorded rather
+than held in memory.
+
+### Work arrives as tasks, in an inbox the platform owns
+
+A **task** is one durable request for an agent to do a named piece of work: `Review` with this
+payload. Tasks land in the agent's **inbox**, which the platform owns, not your code. Each task:
+
+- **is recorded once per task id.** Sending the same id again has no effect, so the task id is
+  also the idempotency key.
+- **is delivered at least once.** A failure or a lost execution means another **attempt** with
+  the same id.
+- **eventually settles:** completed with a result, or failed with a typed error. A settled task
+  never runs again.
+
+### Contract, implementation, client
+
+Every agent has three parts:
+
+```
+contract         Agent.make("Reviewer", [Review])           what it accepts and returns (Effect Rpcs)
+implementation   Reviewer.toLayer(Reviewer.of({ … }))       how it does it (a Layer)
+client           (yield* Reviewer.client)("senior").Review  how anyone calls it
+```
+
+Contracts hold no runtime code, so workflows, scripts, and other agents import only the contract.
+The contract's schemas type every call site, and payloads are checked at runtime. Errors declared
+in the contract reach callers as themselves. Everything else the platform reports is one
+`AgentError`.
+
+### Waiting costs nothing
+
+When code calls another agent and waits, asks a model, or asks a person, the caller **waits**.
+Its task (or workflow run) is marked as waiting, and its execution ends. When the answer arrives,
+the platform delivers the work again, and the code picks up where it was: anything it already
+did returns its recorded result. So agents can wait on each other in both directions without
+deadlocking, and a wait of two days costs the same as one of two seconds.
+
+The price is that **code can run more than once**: the part before a wait runs again when the work
+resumes. The platform makes its own effects happen once. Your code has to make the same calls in
+the same order. See [Rules to know](#rules-to-know).
+
+### Everything resumes; nothing restarts
+
+Each kind of long-running work is a sequence of recorded steps:
+
+| Work | Made of | Resumes from |
+|---|---|---|
+| A **task** | attempts | its last outcome (retries count attempts) |
+| An LLM **turn** | **steps**: one model call or one tool call each | its last recorded step |
+| A **workflow run** | agent calls, timers, signals, activities | its journal of finished steps |
+
+A crash, an eviction, or a redeploy loses at most the step in progress, never the work before it.
+
+### The platform does the infrastructure
+
+The **platform** (`Platform.make`) is one Cloudflare Worker that hosts everything: each agent's
+Durable Object, the workflow engine, the **workspace** (permissioned files), **listeners** (events
+that create work), **human requests**, and an HTTP API. Your agent and workflow code never names a
+bucket, a queue, or a binding. It calls clients and services, and the platform decides where they
+live and how they're wired.
+
+### Identity comes from the platform
+
+Who is asking is determined by where the request comes from, never by a field the caller fills
+in. When an agent reads a file, the workspace checks the running agent's grants. When an agent
+calls another, the platform records which task caused it (the **causation**), so any chain of work
+can be traced afterwards.
+
+### The vocabulary, in one place
+
+| Term | Meaning |
+|---|---|
+| Agent definition / agent | A kind of agent / one named identity of it |
+| Task, inbox, attempt | A durable request / the agent's record of them / one delivery |
+| Send / call / reply | Create a task without waiting / and wait / the answer that comes back |
+| Session, turn, step | An LLM conversation / one prompt's work / one model or tool call |
+| Workspace, home, grant, revision | The shared file space / an agent's own `~/` / a permission / one version of a file |
+| Workflow, run, signal | Code coordinating agents, timers, and people / one execution of it / a typed value sent to a waiting run |
+| Human request | A durable question for a person, with a typed answer and an expiry |
+| Listener | A rule that turns a file upload or a schedule into a task or a run |
 
 ---
 
