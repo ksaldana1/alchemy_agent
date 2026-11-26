@@ -22,6 +22,8 @@ refunds while the demo crashes it at the worst moment: after the payment gateway
 before the agent recorded it. It still issues each refund once and sends each email once.
 `bun run refunds:ui` opens it as a live page you can click through.
 
+[![The refund desk demo: a crashed refund is delivered twice but issued once, a large refund waits for a manager's approval, and the ledger shows 3 gateway requests and 2 refunds.](https://raw.githubusercontent.com/ksaldana1/alchemy_agent/main/docs/assets/refunds-demo.gif)](examples/refunds)
+
 > **Early release:** the API may change. Use the exact Effect and Alchemy versions below;
 > the library currently requires `effect@4.1.5` and Alchemy `2.0.0-beta.87`.
 
