@@ -6,13 +6,14 @@ import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Agent from "../../src/Agent.ts";
 import * as Api from "../../src/Api.ts";
 import { Echo, Flaky, Relay } from "./agents.ts";
+import { Desk } from "./llm.ts";
 
 export default Cloudflare.Worker(
   "AgentTestApi",
   { main: import.meta.url },
   Effect.gen(function* () {
-    const agents = yield* Agent.connect(Echo, Flaky, Relay);
-    const api = yield* Api.routes({ agents: [Echo, Flaky, Relay] });
+    const agents = yield* Agent.connect(Echo, Flaky, Relay, Desk);
+    const api = yield* Api.routes({ agents: [Echo, Flaky, Relay, Desk] });
     return {
       fetch: Effect.gen(function* () {
         const fromApi = yield* api.handle;

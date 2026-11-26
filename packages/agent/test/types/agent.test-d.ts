@@ -2,6 +2,7 @@
 // (TypeScript 7 can hide later errors in a file while earlier ones are present).
 // Sections 1–4: the agreed API's call sites. Section 5: ported from mini-agent-runtime's
 // tests/agent.test.ts ("defineAgent types").
+import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -199,4 +200,74 @@ Agent.make<unknown>()("BadField", {
     // @ts-expect-error `b` is not in the schema
     Effect.succeed(input.b),
   ),
+});
+
+// ===========================================================================
+// 6. LLM agents (M2)
+// ===========================================================================
+
+import * as Tool from "effect/ai/Tool";
+import * as Toolkit from "effect/ai/Toolkit";
+import * as AgentModel from "../../src/AgentModel.ts";
+import type { Desk } from "../fixtures/llm.ts";
+
+// A model adds the built-in `prompt` task next to the agent's own tasks.
+expectTypeOf<Agent.TaskNames<typeof Desk>>().toEqualTypeOf<
+  "prompt" | "review" | "reviewTalkative" | "reviewSloppy" | "counter"
+>();
+expectTypeOf<Agent.TaskInput<typeof Desk, "prompt">>().toEqualTypeOf<{ readonly message: string; readonly session?: string }>();
+declare const desk: Agent.AgentRef<typeof Desk>;
+expectTypeOf(desk.prompt({ message: "hi" })).toEqualTypeOf<
+  Effect.Effect<
+    { text: string },
+    Agent.TaskFailed<Agent.PromptFailed> | Agent.AgentUnreachable,
+    Agent.Reach<"Desk"> | Agent.Waiter
+  >
+>();
+expectTypeOf(desk.review({ article: "a" })).toEqualTypeOf<
+  Effect.Effect<
+    { handlerRuns: number; approved: boolean; notes: string },
+    Agent.TaskFailed<Agent.PromptFailed> | Agent.AgentUnreachable,
+    Agent.Reach<"Desk"> | Agent.Waiter
+  >
+>();
+
+// Agent.prompt returns text, or the output schema's type.
+expectTypeOf(Agent.prompt("hi")).toEqualTypeOf<Effect.Effect<string, Agent.PromptFailed, Agent.Prompting>>();
+expectTypeOf(Agent.prompt("hi", { output: Schema.Struct({ ok: Schema.Boolean }) })).toEqualTypeOf<
+  Effect.Effect<{ readonly ok: boolean }, Agent.PromptFailed, Agent.Prompting>
+>();
+
+const Ping = Tool.make("ping", { success: Schema.String });
+
+// Tool handlers may use AgentContext and ToolCall.
+Agent.make<unknown>()("ToolsOk", {
+  model: AgentModel.scripted([]),
+  tools: Agent.tools(Toolkit.make(Ping), {
+    ping: () =>
+      Effect.gen(function* () {
+        const call = yield* Agent.ToolCall;
+        const ctx = yield* Agent.AgentContext;
+        return `${call.idempotencyKey}:${ctx.taskId}`;
+      }),
+  }),
+  tasks: {},
+});
+
+Agent.make<unknown>()("NoModel", {
+  // @ts-expect-error Task "t" uses Agent.prompt, but the agent has no model
+  t: Agent.task(() => Agent.prompt("hi")),
+});
+
+class Files extends Context.Service<Files, { readonly read: string }>()("Files") {}
+Agent.make<unknown>()("BadTool", {
+  model: AgentModel.scripted([]),
+  // @ts-expect-error A tool handler needs a service the framework does not provide
+  tools: Agent.tools(Toolkit.make(Ping), {
+    ping: () =>
+      Effect.gen(function* () {
+        return (yield* Files).read;
+      }),
+  }),
+  tasks: {},
 });

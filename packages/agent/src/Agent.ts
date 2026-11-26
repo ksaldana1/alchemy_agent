@@ -13,8 +13,15 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import type * as Tool from "effect/ai/Tool";
+import type * as Toolkit from "effect/ai/Toolkit";
 import * as Schema from "effect/Schema";
+import type { AgentModel } from "./AgentModel.ts";
 import {
+  promptingKey,
+  type PromptFailed,
+  type Prompting,
+  type ToolCall,
   reachKey,
   TaskDefTypeId,
   waiterKey,
@@ -35,11 +42,15 @@ import {
 } from "./internal/core.ts";
 import { bindingTransport, makeRef, type AgentRef, type Namespace, type ReservedTaskName } from "./internal/ref.ts";
 import { agentObject } from "./internal/runtime.ts";
+import type { Limits, ToolsDef } from "./internal/session.ts";
 
 export {
   AgentContext,
   AgentUnreachable,
   PermanentError,
+  PromptFailed,
+  ToolCall,
+  type Prompting,
   TaskFailed,
   TaskNotFound,
   type AgentClass,
@@ -61,7 +72,8 @@ export {
 } from "./internal/core.ts";
 export type { StoredFailure, TaskRecord, TaskStatus } from "./internal/inbox.ts";
 /** `AgentRpc` is the Durable Object's internal RPC surface, exported only so class types are nameable. */
-export type { Address, AgentRef, AgentRpc, CallOptions, ReservedTaskName, TaskHandle } from "./internal/ref.ts";
+export type { Address, AgentRef, AgentRpc, CallOptions, ReservedTaskName, TaskHandle, TranscriptEntry } from "./internal/ref.ts";
+export type { Limits, SessionEvent } from "./internal/session.ts";
 
 // ---------------------------------------------------------------------------
 // Agent.task
@@ -111,6 +123,57 @@ export function task(...args: Array<unknown>): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// LLM agents: Agent.prompt and Agent.tools
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs one LLM turn and returns its answer: text, or a value of `output`'s type. Only in agents
+ * with a `model`. The turn is durable: the task waits (holding no execution) while it runs, then
+ * the handler runs again from the top and this call returns the stored answer. So code before a
+ * prompt can run more than once; keep it idempotent.
+ */
+export function prompt(
+  message: string,
+  options?: { readonly session?: string },
+): Effect.Effect<string, PromptFailed, Prompting>;
+export function prompt<Output extends TaskSchema>(
+  message: string,
+  options: { readonly session?: string; readonly output: Output },
+): Effect.Effect<Output["Type"], PromptFailed, Prompting>;
+export function prompt(
+  message: string,
+  options: { readonly session?: string; readonly output?: TaskSchema } = {},
+): Effect.Effect<unknown, PromptFailed, Prompting> {
+  return Effect.flatMap(Effect.service(promptingKey), (p) => p.run(message, options));
+}
+
+/** Services a tool handler may use. */
+type ToolServices<Uses extends ReadonlyArray<AgentClass>> = AgentContext | ToolCall | RefsOf<Uses>;
+
+/** Tools for an LLM agent: an Effect AI toolkit and its handlers. `R`: what the handlers need. */
+export interface AgentTools<R = never> extends ToolsDef {
+  readonly _R?: (_: never) => R;
+}
+
+/**
+ * `tools: Agent.tools(Toolkit.make(LookupOrder), { lookup_order: ({ orderId }) => ... })`. Unlike
+ * plain Effect AI handlers, these may use `AgentContext`, `ToolCall` (for an idempotency key),
+ * and the agents in `uses`.
+ */
+export const tools = <
+  Tools extends Record<string, Tool.Any>,
+  const Handlers extends {
+    readonly [K in keyof Tools]: (
+      params: Tool.Parameters<Tools[K]>,
+    ) => Effect.Effect<Tool.Success<Tools[K]>, Tool.Failure<Tools[K]>, any>;
+  },
+>(
+  toolkit: Toolkit.Toolkit<Tools>,
+  handlers: Handlers,
+): AgentTools<HandlerServices<Handlers>> => ({ toolkit, handlers: handlers as never });
+type HandlerServices<H> = { [K in keyof H]: H[K] extends (...args: any) => Effect.Effect<any, any, infer R> ? R : never }[keyof H];
+
+// ---------------------------------------------------------------------------
 // Agent.make
 // ---------------------------------------------------------------------------
 
@@ -119,10 +182,33 @@ export interface AgentOptions<Uses extends ReadonlyArray<AgentClass>> {
   readonly uses?: Uses;
   /** Default retry policy for every task; each task can override it. */
   readonly retry?: RetryPolicy;
+  /** Makes this an LLM agent: `Agent.prompt` works, and a built-in `prompt` task is added. */
+  readonly model?: AgentModel;
+  /** The system prompt for every turn. */
+  readonly instructions?: string;
+  readonly tools?: AgentTools<any>;
+  readonly limits?: Limits;
 }
 
+/** The built-in task of every LLM agent: one turn in a session (a new one if omitted). */
+export type PromptTask = TaskDef<
+  Schema.Codec<{ readonly message: string; readonly session?: string }, { readonly message: string; readonly session?: string }, never, never>,
+  undefined,
+  { text: string },
+  PromptFailed,
+  Prompting
+>;
+const promptTask = task({ message: Schema.String, session: Schema.optionalKey(Schema.String) }, ({ message, session }) =>
+  Effect.map(prompt(message, session === undefined ? {} : { session }), (text) => ({ text })),
+);
+
 /** A definition is either the tasks themselves, or `{ ...options, tasks }`. */
-type TasksOfDef<D> = D extends { readonly tasks: infer T extends AnyTasks } ? T : D;
+type UserTasksOfDef<D> = D extends { readonly tasks: infer T extends AnyTasks } ? T : D;
+type HasModel<D> = D extends { readonly model: AgentModel } ? true : false;
+type TasksOfDef<D> =
+  HasModel<D> extends true
+    ? Omit<{ readonly prompt: PromptTask }, keyof UserTasksOfDef<D>> & UserTasksOfDef<D>
+    : UserTasksOfDef<D>;
 type UsesOfDef<D> = D extends { readonly uses: infer U extends ReadonlyArray<AgentClass> } ? U : readonly [];
 type RefsOf<Uses extends ReadonlyArray<AgentClass>> = Uses[number] extends infer U
   ? U extends AgentClass
@@ -143,12 +229,24 @@ type CheckTasks<Tasks extends AnyTasks, Allowed> = {
         ? Tasks[K]
         : `Task "${K & string}" returns a value that isn't plain JSON; add an output schema`
       : [Extract<ServicesOf<Tasks[K]>, Waiter>] extends [never]
-        ? `Task "${K & string}" needs a service the framework does not provide`
+        ? [Extract<ServicesOf<Tasks[K]>, Prompting>] extends [never]
+          ? `Task "${K & string}" needs a service the framework does not provide`
+          : `Task "${K & string}" uses Agent.prompt, but the agent has no model`
         : `Task "${K & string}" waits for another agent; use send.<task> until M3`;
 };
 
+type ToolsServicesOf<D> = D extends { readonly tools: AgentTools<infer R> } ? R : never;
+type CheckTools<D> = [Exclude<ToolsServicesOf<D>, ToolServices<UsesOfDef<D>>>] extends [never]
+  ? {}
+  : { readonly tools: "A tool handler needs a service the framework does not provide" };
+
 type CheckDef<D> = D extends { readonly tasks: infer T extends AnyTasks }
-  ? Omit<D, "tasks"> & { readonly tasks: CheckTasks<T, AgentContext | RefsOf<UsesOfDef<D>>> }
+  ? Omit<D, "tasks"> & {
+      readonly tasks: CheckTasks<
+        T,
+        AgentContext | RefsOf<UsesOfDef<D>> | (HasModel<D> extends true ? Prompting : never)
+      >;
+    } & CheckTools<D>
   : D extends AnyTasks
     ? CheckTasks<D, AgentContext>
     : never;
@@ -176,11 +274,22 @@ export const make =
     const def = definition as unknown as Record<string, unknown>;
     const isOptions = "tasks" in def && !isTaskDef(def.tasks);
     const options = (isOptions ? def : {}) as AgentOptions<ReadonlyArray<AgentClass>>;
-    const tasks = (isOptions ? def.tasks : def) as AnyTasks;
+    const userTasks = (isOptions ? def.tasks : def) as AnyTasks;
+    const tasks: AnyTasks =
+      options.model !== undefined && !("prompt" in userTasks) ? { prompt: promptTask, ...userTasks } : userTasks;
 
     const base = Cloudflare.DurableObject<Self>()(
       name,
-      agentObject({ name, tasks, retry: options.retry, uses: options.uses ?? [] }),
+      agentObject({
+        name,
+        tasks,
+        retry: options.retry,
+        uses: options.uses ?? [],
+        model: options.model,
+        instructions: options.instructions,
+        tools: options.tools,
+        limits: options.limits,
+      }),
     );
     const statics: AgentStatics<Name, TasksOfDef<D>> = {
       definition: { name, tasks: tasks as TasksOfDef<D>, retry: options.retry },

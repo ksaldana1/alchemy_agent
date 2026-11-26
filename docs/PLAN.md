@@ -167,6 +167,32 @@ Changes from the plan above, and why:
 - with the scripted model, throwing mid-turn resumes at the failed step, and earlier tool calls do not repeat
 - redeploying mid-turn finishes the turn
 
+**Status (2026-11-26): done.** Library: `AgentModel.ts`, `internal/session.ts` (turns and the
+step engine), `Agent.prompt` / `Agent.tools` / the built-in `prompt` task in `Agent.ts`, and
+session routes in `Api.ts`. Tests: `packages/agent/test/llm.test.ts` (11 scenarios on a scripted
+model, local and on `test_$USER`). Demo: `examples/support-desk` (Workers AI, Llama 3.3), deployed
+on `dev_$USER`; `bun run support:demo <url> chat|events|tickets|redeploy-start|redeploy-finish`.
+All three deployed checks pass (the crash-mid-turn check runs in the cloud suite).
+
+Changes from the plan above, and why:
+- **`Agent.prompt` works inside any task, not only the built-in `prompt` task.** The handler
+  suspends on an unfinished turn: the task becomes `waiting` and holds no execution. When the
+  turn settles, the task is delivered again and the handler reruns from the top, with each
+  finished prompt returning its stored answer (the turn id is `<taskId>#<n>`). Code before a
+  prompt can therefore run more than once. The north star's Reviewer pattern needs this.
+- **Turns queue per session:** one runs at a time, so a transcript never interleaves.
+- **Structured output goes through a `respond` tool** built from the stored JSON Schema
+  (`Tool.dynamic`). The step engine validates it with `SchemaRepresentation.fromJsonSchemaDocument`,
+  and an invalid answer becomes a failed tool result the model corrects. Llama 3.3 needed this on
+  the first real ticket.
+- **Tool idempotency key:** the `Agent.ToolCall` service gives `idempotencyKey` (session/turn/call).
+- **The SSE endpoint ends at `idle`;** clients reconnect with `?after=<last seq>`.
+- **Limits:** `maxSteps` (default 24), `maxTokens`, and `stepTimeout` (60 s). An empty model
+  response counts as a model error (Alchemy's adapter swallows provider errors): 3 in a row fail
+  the turn.
+- **Not done:** the support desk's QA judge and the shared files (they need the workspace and
+  workflows, M4/M5); `AgentModel.gateway` for Anthropic/OpenAI (waiting on a key, 0.5/L6).
+
 ## M3: Agent-to-agent messaging and durable waits
 
 - **Outbox:** `Agent.send(Reviewer.named("junior"), "review", input)` writes an outbox row in the sender's transaction. A callback delivers it to the recipient's `enqueue`. The `taskId` is derived from (sender step, send index), so a redelivery never duplicates.

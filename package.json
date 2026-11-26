@@ -23,7 +23,11 @@
     "hello:deploy": "bun --cwd examples/hello --bun alchemy deploy",
     "hello:plan": "bun --cwd examples/hello --bun alchemy plan",
     "hello:destroy": "bun --cwd examples/hello --bun alchemy destroy",
-    "hello:check": "bun --cwd examples/hello scripts/check.ts"
+    "hello:check": "bun --cwd examples/hello scripts/check.ts",
+    "support:deploy": "bun --cwd examples/support-desk --bun alchemy deploy",
+    "support:plan": "bun --cwd examples/support-desk --bun alchemy plan",
+    "support:destroy": "bun --cwd examples/support-desk --bun alchemy destroy",
+    "support:demo": "bun --cwd examples/support-desk scripts/demo.ts"
   },
   "devDependencies": {
     "@alchemy.run/test": "2.0.0-beta.87",

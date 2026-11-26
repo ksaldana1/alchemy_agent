@@ -2,6 +2,9 @@
 //
 //   POST {prefix}/:type/:name/tasks             { task, input, taskId? }  → 202 TaskRecord
 //   GET  {prefix}/:type/:name/tasks/:taskId     [?wait=<seconds>]        → TaskRecord | 404
+//   GET  {prefix}/:type/:name/sessions/:id      [?after=<seq>]           → transcript (LLM agents)
+//   GET  {prefix}/:type/:name/sessions/:id/events [?after=<seq>]         → SSE: the transcript, then
+//        new messages and turn changes until the session is idle; reconnect with ?after=<last seq>
 //
 // `?wait=1` holds the request until the task settles (up to 20 s), then returns the record.
 // Every request needs `Authorization: Bearer <AGENT_API_TOKEN>`.
@@ -27,7 +30,9 @@ import {
   type Waiter,
 } from "./internal/core.ts";
 import type { TaskRecord } from "./internal/inbox.ts";
-import { bindingTransport, type Namespace } from "./internal/ref.ts";
+import { bindingTransport, type AgentRpc, type Namespace } from "./internal/ref.ts";
+import type { SessionEvent } from "./internal/session.ts";
+import * as Stream from "effect/Stream";
 
 /** The env var (bound as a Worker secret) holding the API's bearer token. */
 export const TOKEN_ENV = "AGENT_API_TOKEN";
@@ -71,6 +76,22 @@ export const routes = <const Agents extends ReadonlyArray<AgentClass>>(options: 
       if (!url.pathname.startsWith(`${prefix}/`)) return undefined;
       if (!timingSafeEqual(request.headers["authorization"] ?? "", `Bearer ${Redacted.value(token)}`)) {
         return yield* json({ error: "unauthorized" }, 401);
+      }
+      const sessionMatch = url.pathname.slice(prefix.length).match(/^\/([^/]+)\/([^/]+)\/sessions\/([^/]+)(\/events)?$/);
+      if (sessionMatch && request.method === "GET") {
+        const ns = byType.get(decodeURIComponent(sessionMatch[1]!));
+        if (!ns) return yield* json({ error: "not found" }, 404);
+        const stub = ns.getByName(decodeURIComponent(sessionMatch[2]!)) as AgentRpc;
+        const sessionId = decodeURIComponent(sessionMatch[3]!);
+        const after = Number(url.searchParams.get("after") ?? 0) || 0;
+        if (sessionMatch[4] === undefined) return yield* json(yield* stub.transcript(sessionId, after));
+        const sse = (stub.events(sessionId, after) as Stream.Stream<SessionEvent>).pipe(
+          Stream.map((e) => `${e.type === "message" ? `id: ${e.seq}\n` : ""}event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`),
+          Stream.encodeText,
+        );
+        return HttpServerResponse.stream(sse, {
+          headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+        });
       }
       const m = url.pathname.slice(prefix.length).match(/^\/([^/]+)\/([^/]+)\/tasks(?:\/([^/]+))?$/);
       const namespace = m ? byType.get(decodeURIComponent(m[1]!)) : undefined;
@@ -121,17 +142,20 @@ export const connect = <const Agents extends ReadonlyArray<AgentClass>>(
       const send = (request: HttpClientRequest.HttpClientRequest) =>
         client.execute(request.pipe(HttpClientRequest.bearerToken(token))).pipe(
           Effect.flatMap((res) =>
-            Effect.flatMap(res.json, (body) =>
-              res.status === 404 && request.method === "GET"
-                ? Effect.succeed(null)
-                : res.status >= 200 && res.status < 300
-                  ? Effect.succeed(body as unknown as TaskRecord)
-                  : Effect.fail(
-                      new AgentUnreachable({
-                        message: `HTTP ${res.status}: ${String((body as { error?: unknown } | null)?.error ?? "")}`,
-                      }),
-                    ),
-            ),
+            Effect.flatMap(res.text, (text) => {
+              let body: unknown = undefined;
+              try {
+                body = JSON.parse(text);
+              } catch {}
+              const apiError = (body as { error?: unknown } | undefined)?.error;
+              // Only the API's own "not found" means the task doesn't exist. A 404 from the edge
+              // (a fresh workers.dev URL still converging) is retried like any other failure.
+              if (res.status === 404 && request.method === "GET" && apiError === "not found") return Effect.succeed(null);
+              if (res.status >= 200 && res.status < 300 && body !== undefined) return Effect.succeed(body as TaskRecord);
+              return Effect.fail(
+                new AgentUnreachable({ message: `HTTP ${res.status}: ${String(apiError ?? text.slice(0, 200))}` }),
+              );
+            }),
           ),
           Effect.catchTag("HttpClientError", (e) => Effect.fail(new AgentUnreachable({ message: e.message }))),
           // Every operation is idempotent, so a 5xx or a dropped connection is retried.

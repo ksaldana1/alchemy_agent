@@ -218,7 +218,9 @@ Still to come:
 - `uses` must still be declared (Alchemy only binds Durable Objects at construction time;
   `Platform.make` could infer it later)
 - waiting from inside a handler (M3)
-- LLM agents (M2)
+- LLM agents: done in M2 (`model`, `instructions`, `tools: Agent.tools(...)`, and
+  `Agent.prompt(..., { output })` inside tasks, which reruns the handler after the turn, as
+  `Reviewer.review` needs). `AgentModel.gateway({ provider: "anthropic" })` still waits on a key.
 - the workspace (M4), workflows (M5), listeners (M6), human requests (M7), and `Platform.make`
 
 ## What is invented beyond the plan

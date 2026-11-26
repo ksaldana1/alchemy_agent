@@ -18,7 +18,8 @@ export interface Sql {
   >;
 }
 
-export type TaskStatus = "pending" | "running" | "completed" | "failed";
+/** `waiting`: suspended on a prompt's turn (M2); it resumes as `pending` when the turn settles. */
+export type TaskStatus = "pending" | "running" | "waiting" | "completed" | "failed";
 
 /** A failure as stored: the tag and message survive, class identity does not. */
 export interface StoredFailure {
@@ -83,6 +84,36 @@ const MIGRATIONS: ReadonlyArray<string> = [
    CREATE INDEX alchemy_agent_inbox_due ON alchemy_agent_inbox (status, run_at, seq);
    CREATE TABLE alchemy_agent_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
    INSERT INTO alchemy_agent_meta (key, value) VALUES ('drain_cursor', 0);`,
+  // M2: LLM sessions. A turn is one prompt; it runs as a sequence of persisted steps.
+  `CREATE TABLE alchemy_agent_turns (
+     id            TEXT    PRIMARY KEY,
+     session_id    TEXT    NOT NULL,
+     task_id       TEXT    NOT NULL,
+     status        TEXT    NOT NULL,
+     message       TEXT    NOT NULL,
+     output_schema TEXT,
+     steps         INTEGER NOT NULL DEFAULT 0,
+     errors        INTEGER NOT NULL DEFAULT 0,
+     ticks         INTEGER NOT NULL DEFAULT 0,
+     tokens_in     INTEGER NOT NULL DEFAULT 0,
+     tokens_out    INTEGER NOT NULL DEFAULT 0,
+     output        TEXT,
+     error         TEXT,
+     created_at    INTEGER NOT NULL,
+     started_at    INTEGER,
+     settled_at    INTEGER
+   );
+   CREATE INDEX alchemy_agent_turns_session ON alchemy_agent_turns (session_id, status, created_at);
+   CREATE TABLE alchemy_agent_transcript (
+     session_id TEXT    NOT NULL,
+     seq        INTEGER NOT NULL,
+     turn_id    TEXT    NOT NULL,
+     kind       TEXT    NOT NULL,
+     message    TEXT    NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY (session_id, seq)
+   );
+   CREATE TABLE alchemy_agent_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);`,
 ];
 
 export const migrate = (
@@ -251,10 +282,41 @@ export const retryLater = (sql: Sql, seq: number, error: StoredFailure, runAt: n
  * `progress` when it reschedules itself (without it, Alchemy treats each reschedule as a
  * retry and backs off; see docs/spike/0.3-durable-callbacks.md E9).
  */
-export const advanceCursor = (sql: Sql) =>
+export const advanceCursor = (sql: Sql, key: "drain_cursor" | "step_cursor" = "drain_cursor") =>
   Effect.flatMap(
     sql.exec<{ value: number }>(
-      "UPDATE alchemy_agent_meta SET value = value + 1 WHERE key = 'drain_cursor' RETURNING value",
+      "INSERT INTO alchemy_agent_meta (key, value) VALUES (?, 1) ON CONFLICT (key) DO UPDATE SET value = value + 1 RETURNING value",
+      key,
+    ),
+    (c) => c.one(),
+  ).pipe(Effect.map((r) => r.value));
+
+/** The handler reached an unfinished turn: the task waits. The suspended run isn't an attempt. */
+export const suspend = (sql: Sql, seq: number) =>
+  sql
+    .exec(
+      "UPDATE alchemy_agent_inbox SET status = 'waiting', attempts = attempts - 1 WHERE seq = ? AND status = 'running'",
+      seq,
+    )
+    .pipe(Effect.asVoid);
+
+/** A waiting task's turn settled: deliver it again, now. Returns whether it was waiting. */
+export const resume = (sql: Sql, taskId: string, now: number) =>
+  Effect.flatMap(
+    sql.exec<{ seq: number }>(
+      "UPDATE alchemy_agent_inbox SET status = 'pending', run_at = ? WHERE task_id = ? AND status = 'waiting' RETURNING seq",
+      now,
+      taskId,
+    ),
+    (c) => c.toArray(),
+  ).pipe(Effect.map((rows) => rows.length > 0));
+
+/** Increments a durable counter (used by `alchemy-agent/testing`). */
+export const count = (sql: Sql, name: string) =>
+  Effect.flatMap(
+    sql.exec<{ value: number }>(
+      "INSERT INTO alchemy_agent_counters (name, value) VALUES (?, 1) ON CONFLICT (name) DO UPDATE SET value = value + 1 RETURNING value",
+      name,
     ),
     (c) => c.one(),
   ).pipe(Effect.map((r) => r.value));

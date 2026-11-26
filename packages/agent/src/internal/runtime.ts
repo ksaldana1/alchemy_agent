@@ -8,11 +8,17 @@ import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Tool from "effect/ai/Tool";
 import * as Schema from "effect/Schema";
+import type { AgentModel } from "../AgentModel.ts";
 import {
   AgentContext,
   CurrentExecution,
+  PromptFailed,
+  promptingKey,
   reachKey,
+  Suspend,
+  type PromptService,
   type AgentClass,
   type AnyTaskDef,
   type AnyTasks,
@@ -21,16 +27,19 @@ import {
 } from "./core.ts";
 import * as Inbox from "./inbox.ts";
 import { bindingTransport, type AgentRpc, type Namespace } from "./ref.ts";
+import { makeSessions, type Limits, type ToolsDef } from "./session.ts";
 
 const DEFAULT_RETRY = { maxAttempts: 3, delay: "1 second", maxDelay: "5 minutes" } as const;
 /** Tasks run per drain pass before it reschedules itself, so one pass stays short. */
 const DRAIN_BATCH = 10;
 const DRAIN_CALLBACK = "alchemy-agent/drain";
+const STEP_CALLBACK = "alchemy-agent/step";
 
 class InvalidInput extends Data.TaggedError("InvalidInput")<{ readonly message: string }> {}
 
 type Outcome =
   | { readonly _tag: "Completed"; readonly result: unknown }
+  | { readonly _tag: "Suspended" }
   | { readonly _tag: "Failed"; readonly permanent: boolean; readonly error: Inbox.StoredFailure };
 
 const failureOf = (error: unknown): Inbox.StoredFailure =>
@@ -46,6 +55,11 @@ export interface AgentConfig {
   readonly tasks: AnyTasks;
   readonly retry: RetryPolicy | undefined;
   readonly uses: ReadonlyArray<AgentClass>;
+  /** LLM agents (M2). */
+  readonly model: AgentModel | undefined;
+  readonly instructions: string | undefined;
+  readonly tools: ToolsDef | undefined;
+  readonly limits: Limits | undefined;
 }
 
 /** The outer (construction) Effect for `Cloudflare.DurableObject<Self>()(name, ...)`. */
@@ -71,6 +85,8 @@ export const agentObject = (config: AgentConfig) => {
     for (const other of uses) {
       namespaces.push([other, (yield* (other as unknown as Effect.Effect<Namespace>)) as Namespace]);
     }
+    // The model binding, also bound here.
+    const modelLayer = config.model ? yield* config.model.build : undefined;
 
     return Effect.gen(function* () {
       const sql = state.storage.sql as unknown as Inbox.Sql;
@@ -90,6 +106,87 @@ export const agentObject = (config: AgentConfig) => {
           return Effect.forEach(ds, (d) => Deferred.succeed(d, undefined), { discard: true });
         });
 
+      const execution = {
+        abort: (reason: string) => state.raw.abort(reason),
+        // Synced before returning, so the count survives an abort right after (tests crash on it).
+        count: (counter: string) =>
+          Inbox.count(sql, counter).pipe(Effect.tap(() => state.storage.sync())) as Effect.Effect<number>,
+      };
+
+      /** Services agent code gets: AgentContext and the agents in `uses` (with causation). */
+      const agentServices = (taskId: string, attempt: number) => {
+        const causation = `${name}/${agentName}/${taskId}`;
+        let services = Context.make(AgentContext, { agent: { type: name, name: agentName }, taskId, attempt });
+        for (const [other, namespace] of namespaces) {
+          services = Context.add(services, reachKey(other.definition.name), {
+            transport: (n: string) => bindingTransport(namespace, n, causation),
+          });
+        }
+        return services;
+      };
+
+      let stepCallback: Alchemy.Callback<{ readonly v: 1; readonly turnId: string }> | undefined;
+      const sessions = makeSessions({
+        sql,
+        transaction,
+        now,
+        model: modelLayer,
+        instructions: config.instructions,
+        tools: config.tools,
+        limits: config.limits,
+        execution,
+        toolServices: (taskId) =>
+          Inbox.get(sql, taskId).pipe(
+            Effect.map((row) => agentServices(taskId, row?.attempts ?? 1) as Context.Context<never>),
+          ),
+        scheduleStep: (turnId, afterMs, progress) =>
+          stepCallback!.schedule(turnId, { after: `${afterMs} millis`, payload: { v: 1, turnId }, progress }).pipe(Effect.orDie),
+        onSettled: (taskId) =>
+          Effect.gen(function* () {
+            // With `progress`, the drain doesn't inherit the step job's attempt count (and backoff).
+            if (yield* Inbox.resume(sql, taskId, now())) yield* scheduleDrain(now(), yield* Inbox.advanceCursor(sql));
+          }),
+      });
+
+      /** `Agent.prompt` inside a handler: the i-th prompt of a task is turn `<taskId>#<i>`. */
+      const prompting = (row: Inbox.InboxRow): PromptService => {
+        let index = 0;
+        return {
+          run: (message, options) =>
+            Effect.gen(function* () {
+              const turnId = `${row.task_id}#${index++}`;
+              const outcome = yield* sessions.outcome(turnId);
+              if (outcome === undefined) {
+                const sessionId = options.session ?? turnId;
+                const events = yield* transaction(
+                  sessions.createTurn({
+                    id: turnId,
+                    sessionId,
+                    taskId: row.task_id,
+                    message,
+                    // Both forms: the tool's parameters (for the model) and a document (for validation).
+                    outputSchema: options.output
+                      ? { tool: Tool.getJsonSchemaFromSchema(options.output), document: Schema.toJsonSchemaDocument(options.output) }
+                      : undefined,
+                  }),
+                );
+                for (const e of events) yield* sessions.emit(sessionId, e);
+                return yield* Effect.die(new Suspend(turnId));
+              }
+              if (outcome === "pending") return yield* Effect.die(new Suspend(turnId));
+              if (outcome.status === "failed") {
+                const e = outcome.error ?? { reason: "ModelError" as const, message: "the turn failed" };
+                // The reason leads the message: stored failures keep only the tag and the message.
+                return yield* new PromptFailed({ reason: e.reason, message: `${e.reason}: ${e.message}` });
+              }
+              if (options.output === undefined) return outcome.output;
+              return yield* Schema.decodeUnknownEffect(options.output)(outcome.output).pipe(
+                Effect.mapError((issue) => new PromptFailed({ reason: "InvalidOutput", message: issue.message })),
+              );
+            }) as Effect.Effect<unknown, PromptFailed>,
+        };
+      };
+
       const execute = (row: Inbox.InboxRow, attempt: number): Effect.Effect<Outcome, never, RuntimeContext> => {
         const def: AnyTaskDef | undefined = tasks[row.task];
         if (def === undefined) {
@@ -99,17 +196,8 @@ export const agentObject = (config: AgentConfig) => {
             error: { _tag: "UnknownTaskError", message: `No task "${row.task}"` },
           });
         }
-        const causation = `${name}/${agentName}/${row.task_id}`;
-        let services = Context.make(AgentContext, {
-          agent: { type: name, name: agentName },
-          taskId: row.task_id,
-          attempt,
-        });
-        for (const [other, namespace] of namespaces) {
-          services = Context.add(services, reachKey(other.definition.name), {
-            transport: (n: string) => bindingTransport(namespace, n, causation),
-          });
-        }
+        let services: Context.Context<any> = agentServices(row.task_id, attempt);
+        if (modelLayer !== undefined) services = Context.add(services, promptingKey, prompting(row));
 
         return Effect.gen(function* () {
           const input = yield* Schema.decodeUnknownEffect(def.input as TaskSchema)(JSON.parse(row.input)).pipe(
@@ -117,7 +205,7 @@ export const agentObject = (config: AgentConfig) => {
           );
           const value = yield* (def.handler(input) as Effect.Effect<unknown, unknown, never>).pipe(
             Effect.provideContext(services as Context.Context<never>),
-            Effect.provideService(CurrentExecution, { abort: (reason) => state.raw.abort(reason) }),
+            Effect.provideService(CurrentExecution, execution),
             Effect.annotateLogs({ agent: `${name}/${agentName}`, taskId: row.task_id, attempt }),
           );
           return def.output === undefined
@@ -138,9 +226,13 @@ export const agentObject = (config: AgentConfig) => {
               const error = failureOf(reason.error);
               return Effect.succeed<Outcome>({
                 _tag: "Failed",
-                permanent: error._tag === "PermanentError",
+                // A failed turn fails the same way on every rerun, so it settles the task.
+                permanent: error._tag === "PermanentError" || error._tag === "PromptFailed",
                 error,
               });
+            }
+            if (reason?._tag === "Die" && reason.defect instanceof Suspend) {
+              return Effect.succeed<Outcome>({ _tag: "Suspended" });
             }
             return Effect.succeed<Outcome>({
               _tag: "Failed",
@@ -190,7 +282,9 @@ export const agentObject = (config: AgentConfig) => {
           yield* transaction(
             result._tag === "Completed"
               ? Inbox.complete(sql, row.seq, result.result, now())
-              : afterFailure(row, attempt, result.error, result.permanent),
+              : result._tag === "Suspended"
+                ? Inbox.suspend(sql, row.seq)
+                : afterFailure(row, attempt, result.error, result.permanent),
           );
           yield* release(row.task_id);
           processed++;
@@ -205,11 +299,24 @@ export const agentObject = (config: AgentConfig) => {
       drain = yield* Alchemy.makeCallback(DRAIN_CALLBACK, (_: { readonly v: 1 }) => drainPass, {
         retry: { delay: "1 second" },
       });
+      // Registered on every agent (callback names are a persisted contract), used by LLM agents.
+      stepCallback = yield* Alchemy.makeCallback(
+        STEP_CALLBACK,
+        (p: { readonly v: 1; readonly turnId: string }) => sessions.step(p.turnId),
+        { retry: { delay: "1 second" } },
+      );
 
       const record = (taskId: string) =>
         Inbox.get(sql, taskId).pipe(Effect.map((row) => (row === undefined ? null : Inbox.toRecord(row))));
 
       const rpc: AgentRpc = {
+        transcript: (sessionId, after) =>
+          sessions.messages(sessionId, after).pipe(
+            Effect.map((rows) =>
+              rows.map((r) => ({ seq: r.seq, turnId: r.turn_id, kind: r.kind, message: JSON.parse(r.message), createdAt: r.created_at })),
+            ),
+          ),
+        events: (sessionId, after) => sessions.events(sessionId, after),
         enqueue: (taskId, task, input, options) =>
           transaction(
             Effect.gen(function* () {

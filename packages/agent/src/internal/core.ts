@@ -68,7 +68,12 @@ export const waiterKey = Context.Service<Waiter, true>("alchemy-agent/Waiter");
 
 /** The current task execution; read by `alchemy-agent/testing`. */
 export const CurrentExecution = Context.Reference<
-  { readonly abort: (reason: string) => void } | undefined
+  | {
+      readonly abort: (reason: string) => void;
+      /** Increments a durable counter (tests count executions across crashes). */
+      readonly count: (name: string) => Effect.Effect<number>;
+    }
+  | undefined
 >("alchemy-agent/CurrentExecution", { defaultValue: () => undefined });
 
 // ---------------------------------------------------------------------------
@@ -117,6 +122,53 @@ export class TaskNotFound extends Data.TaggedError("TaskNotFound")<{
 export class AgentUnreachable extends Data.TaggedError("AgentUnreachable")<{
   readonly message: string;
 }> {}
+
+// ---------------------------------------------------------------------------
+// LLM turns
+// ---------------------------------------------------------------------------
+
+/** A prompt's turn ended without an answer. */
+export class PromptFailed extends Data.TaggedError("PromptFailed")<{
+  readonly reason: "StepLimit" | "TokenBudget" | "ModelError" | "InvalidOutput";
+  readonly message: string;
+}> {}
+
+/** Running prompts. Only agents with a `model` have it. */
+export interface Prompting {
+  readonly _Prompting: unique symbol;
+}
+
+export interface PromptOptions {
+  /** The session (conversation) to continue. Default: a new session for this prompt. */
+  readonly session?: string;
+  /** A schema for a structured answer; the model gives it through a `respond` tool. */
+  readonly output?: TaskSchema;
+}
+
+export interface PromptService {
+  readonly run: (message: string, options: PromptOptions) => Effect.Effect<unknown, PromptFailed>;
+}
+export const promptingKey = Context.Service<Prompting, PromptService>("alchemy-agent/Prompting");
+
+/**
+ * Raised (as a defect, so handlers' error handling doesn't swallow it) when a handler reaches a
+ * prompt whose turn hasn't finished: the task suspends and resumes when the turn settles.
+ */
+export class Suspend {
+  readonly _tag = "alchemy-agent/Suspend";
+  constructor(readonly turnId: string) {}
+}
+
+/** The tool call being executed. `idempotencyKey` is stable across redeliveries of the call. */
+export class ToolCall extends Context.Service<
+  ToolCall,
+  {
+    readonly sessionId: string;
+    readonly turnId: string;
+    readonly toolCallId: string;
+    readonly idempotencyKey: string;
+  }
+>()("alchemy-agent/ToolCall") {}
 
 // ---------------------------------------------------------------------------
 // Task definitions and helper types

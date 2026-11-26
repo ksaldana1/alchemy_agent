@@ -143,6 +143,36 @@ previous code for a few minutes. Callers must tolerate an instance that is one v
 add RPC methods without removing old ones, and have callers fall back when a new method is
 missing. (`wait` falls back to reading the record.)
 
+## LLM turns (implemented in M2)
+
+**Storage.** Two more tables in the agent's Durable Object. `alchemy_agent_turns` holds one row
+per prompt: status `queued` / `running` / `completed` / `failed`, the message, the output schema,
+step, error and token counters, and the output. `alchemy_agent_transcript` holds one row per
+message (`user`, `model`, `tool_result`) per session, encoded with Effect AI's `Prompt.Message`
+schema.
+
+**A prompt.** `Agent.prompt(message, { session?, output? })` inside a handler looks up turn
+`<taskId>#<n>`. A finished turn returns its answer. Otherwise, in one transaction, the turn is
+recorded and started if its session is free (the user message is appended and the first step
+scheduled). The handler then suspends (a defect, so handler error handling can't swallow it),
+and the task becomes `waiting`.
+
+**A step** (durable callback `alchemy-agent/step`, job id = turn id) does exactly one of:
+- One model call with tool resolution disabled and deferred argument validation, persisted as a
+  `model` row.
+- One tool call, persisted as a `tool_result` row. Invalid arguments and typed tool failures
+  become failed results the model sees.
+- Settling the turn: its text, or a valid `respond` call.
+
+Each step schedules the next with `progress` from one counter for the whole Durable Object,
+because Alchemy compares a new job's progress with the scheduling job's, even across job ids.
+Settling resumes the waiting task (`waiting` → `pending`) and starts the session's next queued
+turn, in one transaction.
+
+**Watching.** Every persisted row and turn change is pushed to in-memory listeners. `GET
+…/sessions/:id/events` replays the transcript after `?after=`, then streams new rows until the
+session is idle.
+
 ## To be added after M0
 
 - Components and responsibilities, and how they map onto Cloudflare and Alchemy resources.

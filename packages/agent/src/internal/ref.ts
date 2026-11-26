@@ -5,6 +5,8 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import type * as Stream from "effect/Stream";
+import type { SessionEvent } from "./session.ts";
 import {
   AgentUnreachable,
   reachKey,
@@ -167,7 +169,19 @@ export type AgentRpc = {
   ) => Effect.Effect<TaskRecord, never, any>;
   get: (taskId: string) => Effect.Effect<TaskRecord | null, never, any>;
   wait: (taskId: string, timeoutMs: number) => Effect.Effect<TaskRecord | null, never, any>;
+  /** M2: an LLM session's transcript after `after`. */
+  transcript: (sessionId: string, after: number) => Effect.Effect<ReadonlyArray<TranscriptEntry>, never, any>;
+  /** M2: the transcript after `after`, then new messages until the session is idle. */
+  events: (sessionId: string, after: number) => Stream.Stream<SessionEvent, never, any>;
 };
+
+export interface TranscriptEntry {
+  readonly seq: number;
+  readonly turnId: string;
+  readonly kind: string;
+  readonly message: unknown;
+  readonly createdAt: number;
+}
 
 /** How long one `wait` RPC holds before returning the current record. */
 export const WAIT_CHUNK_MS = 20_000;

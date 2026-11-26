@@ -19,7 +19,8 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
 - Commands. Library tests: `bun run test` (local workerd) and `bun run test:cloud` (deploys
   `test_$USER`, then destroys it). Spike suites: `bun run test:spikes[:cloud]`. The Hello
   example: `bun run hello:dev|deploy|plan|destroy|check`. It needs `AGENT_API_TOKEN` in
-  `examples/hello/.env`, which is gitignored.
+  `examples/hello/.env`, which is gitignored. The support desk (LLM agents on Workers AI):
+  `bun run support:deploy|plan|destroy|demo`, with the same token in `examples/support-desk/.env`.
 - `bun run dev` / `hello:dev` use the `local_$USER` stage. `alchemy dev` on a deployed stage
   replaces the live Worker with a local one.
 - A class-style `Context.Service` has no `.asEffect()`. Use `yield* Service` or
