@@ -9,6 +9,8 @@
   ],
   "scripts": {
     "typecheck": "tsc -b",
+    "build": "cd packages/agent && bun run build",
+    "release": "cd packages/agent && bun run release",
     "test": "cd packages/agent && ALCHEMY_TEST_DEV=1 bun test",
     "test:cloud": "cd packages/agent && bun test",
     "test:spikes": "cd spikes && ALCHEMY_TEST_DEV=1 bun test",

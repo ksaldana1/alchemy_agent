@@ -1,6 +1,6 @@
 // Builds the npm package into dist/: compiled JS + .d.ts, the sources (for source maps), and a
 // package.json whose exports point at the compiled files. The workspace package.json keeps
-// pointing at src/ so the examples and tests run without a build. Publish with `npm publish dist`.
+// pointing at src/ so the examples and tests run without a build. Publish with `npm publish ./dist`.
 import { $, Glob } from "bun";
 
 await $`rm -rf dist`;

@@ -17,15 +17,31 @@ const { greeting } = yield* greeters("ada").Greet({ name: "Ada" });
 come from your contract. This call works inside an Effect program in another agent, a workflow,
 or a script connected over HTTP.
 
-> **Pre-release:** the package is not published to npm, and the API may change. For now, use it
-> within this repository's Bun workspace. It pins `effect` to `4.1.5` and `alchemy` and
-> `@alchemy.run/cloudflare` to `2.0.0-beta.87`.
+> **Early release:** the API may change. Use the exact Effect and Alchemy versions below;
+> the library currently requires `effect@4.1.5` and Alchemy `2.0.0-beta.87`.
 
+- [Install](#install)
 - [Try the Hello example](#try-the-hello-example)
 - [Build your own agent](#build-your-own-agent)
 - [Call it from TypeScript](#call-it-from-typescript)
 - [How durability works](#how-durability-works)
 - [Explore the library](#explore-the-library)
+
+## Install
+
+Use [Bun](https://bun.sh) to install the library and run your Alchemy app. In an existing project:
+
+```sh
+bun add --exact alchemy-agent@0.1.0 effect@4.1.5 alchemy@2.0.0-beta.87 @alchemy.run/cloudflare@2.0.0-beta.87 @effect/platform-bun@4.1.5
+```
+
+`effect`, `alchemy`, and `@alchemy.run/cloudflare` are peer dependencies. `@effect/platform-bun`
+is needed to run the Alchemy CLI under Bun. The npm package includes compiled JavaScript and
+TypeScript declarations, with exports at `alchemy-agent` and `alchemy-agent/testing`.
+
+To start a new app, create a directory with the `package.json` in
+[Build your own agent](#build-your-own-agent), then run `bun install`. You don't need a checkout
+of this repository. The Hello example below is an optional way to explore the library from source.
 
 ## Try the Hello example
 
@@ -104,16 +120,29 @@ uses `Platform.make` to set up the Worker for you.
 The examples assume some familiarity with Effect: `Effect.gen` composes operations, `yield*`
 runs an Effect within that program, and a `Layer` provides services an implementation needs.
 
-Create an app under `examples/my-agent/` so it belongs to this repository's workspace. Add this
-`package.json`, then run `bun install` from the repository root:
+Create a directory for your app:
+
+```sh
+mkdir my-agent
+cd my-agent
+```
+
+Save this as `package.json`:
 
 ```json
 {
   "name": "my-agent",
   "private": true,
   "type": "module",
+  "scripts": {
+    "alchemy": "bun --bun alchemy",
+    "dev": "bun --bun alchemy dev --stage local_$USER",
+    "plan": "bun --bun alchemy plan --stage dev_$USER",
+    "deploy": "bun --bun alchemy deploy --stage dev_$USER",
+    "destroy": "bun --bun alchemy destroy --stage dev_$USER"
+  },
   "dependencies": {
-    "alchemy-agent": "workspace:*",
+    "alchemy-agent": "0.1.0",
     "alchemy": "2.0.0-beta.87",
     "@alchemy.run/cloudflare": "2.0.0-beta.87",
     "@effect/platform-bun": "4.1.5",
@@ -122,8 +151,16 @@ Create an app under `examples/my-agent/` so it belongs to this repository's work
 }
 ```
 
-The `workspace:*` dependency resolves the local library; it will not work in an unrelated project.
-The following file paths are relative to `examples/my-agent/`.
+Install dependencies and connect your Cloudflare account using
+[Alchemy's profile setup](https://alchemy.run/cloudflare/setup):
+
+```sh
+bun install
+bun run alchemy profile
+mkdir src
+```
+
+All following file paths and commands are relative to your new `my-agent/` directory.
 
 An app has four parts: **contracts** (what agents accept and return), **implementations**
 (Layers), a **platform** (one Worker that hosts it all), and an Alchemy **stack**.
@@ -197,12 +234,21 @@ export default Alchemy.Stack(
 );
 ```
 
-Create `examples/my-agent/.env` with `AGENT_API_TOKEN`, as in the Hello example. From the
-repository root, deploy your app with:
+Create `.env` next to `alchemy.run.ts`:
+
+```dotenv
+AGENT_API_TOKEN=replace-with-your-long-random-token
+```
+
+Add `.env`, `node_modules/`, and `.alchemy/` to your app's `.gitignore`. Then preview and deploy:
 
 ```sh
-bun --cwd examples/my-agent --bun alchemy deploy --stage dev_$USER --yes
+bun run plan
+bun run deploy --yes
 ```
+
+These scripts use the `dev_$USER` stage. For local development, `bun run dev` uses a separate
+`local_$USER` stage. To remove the deployed app and its stored data, run `bun run destroy --yes`.
 
 Use the same HTTP requests as above with your new deployment URL. This handler returns
 `{ "greeting": "Hello, Ada!" }` as its result.
@@ -210,7 +256,7 @@ Use the same HTTP requests as above with your new deployment URL. This handler r
 ## Call it from TypeScript
 
 For scripts and tests, connect to the deployment and use the same typed agent client.
-Save this as `examples/my-agent/src/client.ts`:
+Save this as `src/client.ts` in your app:
 
 ```ts
 import { Platform } from "alchemy-agent";
@@ -236,10 +282,12 @@ await Effect.runPromise(
 );
 ```
 
-With `URL` and `AGENT_API_TOKEN` set in your terminal, run it from the repository root:
+Set `URL` to your deployment URL and run the script from your app directory. Bun loads
+`AGENT_API_TOKEN` from `.env`:
 
 ```sh
-bun --cwd examples/my-agent src/client.ts
+export URL="https://your-worker.workers.dev"
+bun src/client.ts
 # Hello, Ada!
 ```
 

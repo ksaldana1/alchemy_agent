@@ -27,7 +27,7 @@
   },
   "scripts": {
     "build": "bun scripts/build.ts",
-    "release": "bun run build && npm publish dist"
+    "release": "bun run build && npm publish ./dist"
   },
   "publishConfig": {
     "access": "public"
