@@ -2,10 +2,18 @@
   "name": "alchemy-agent-workspace",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*", "spikes"],
+  "workspaces": [
+    "packages/*",
+    "spikes"
+  ],
   "scripts": {
     "typecheck": "tsc -b",
-    "test": "bun test"
+    "test": "bun test",
+    "alchemy": "bun --cwd spikes --bun alchemy",
+    "dev": "bun --cwd spikes --bun alchemy dev",
+    "deploy": "bun --cwd spikes --bun alchemy deploy",
+    "plan": "bun --cwd spikes --bun alchemy plan",
+    "destroy": "bun --cwd spikes --bun alchemy destroy"
   },
   "devDependencies": {
     "@alchemy.run/test": "2.0.0-beta.87",
