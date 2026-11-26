@@ -1,6 +1,7 @@
 // Test agents. Each task exercises one inbox behavior. Contracts first, then implementations.
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import { Rpc } from "effect/rpc";
 import * as Agent from "../../src/Agent.ts";
@@ -44,7 +45,12 @@ export const FlakyTask = Rpc.make("FlakyTask", { payload: { failTimes: Schema.Nu
 export const Refuse = Rpc.make("Refuse", { error: Nope });
 export const Die = Rpc.make("Die");
 export const Crash = Rpc.make("Crash", { payload: { times: Schema.Number }, success: Schema.Struct({ attempt: Schema.Number }) });
-export const Flaky = Agent.make("Flaky", [FlakyTask, Refuse, Die, Crash]);
+/** Like FlakyTask, with a Schedule as its retry policy: 4 retries 100 ms apart (5 attempts). */
+export const FlakyScheduled = Rpc.make("FlakyScheduled", {
+  payload: { failTimes: Schema.Number },
+  success: Schema.Struct({ attempt: Schema.Number }),
+}).annotate(Agent.Retry, Schedule.spaced("100 millis").pipe(Schedule.upTo({ times: 4 })));
+export const Flaky = Agent.make("Flaky", [FlakyTask, Refuse, Die, Crash, FlakyScheduled]);
 
 export const Forward = Rpc.make("Forward", { payload: { text: Schema.String }, success: Schema.Struct({ taskId: Schema.String }) });
 /** Waits for another agent's answer inside a handler. */
@@ -70,7 +76,11 @@ export const CrashAfterAnswer = Rpc.make("CrashAfterAnswer", {
 });
 /** Waits on a keyed task, which may have settled already. */
 export const AskKeyed = Rpc.make("AskKeyed", { payload: { id: Schema.String, text: Schema.String }, success: Schema.String });
-export const Relay = Agent.make("Relay", [Forward, AskEcho, Volley, AskRefuse, FanOut, CrashAfterAnswer, AskKeyed]);
+/** Waits on a call inside `catchDefect`: the suspension isn't a defect, so it passes through. */
+export const AskDefectSafe = Rpc.make("AskDefectSafe", { payload: { text: Schema.String }, success: Schema.String });
+/** Catches the call's suspension with `Effect.exit`: the outcome is discarded, and the rerun gets the answer. */
+export const AskSwallowing = Rpc.make("AskSwallowing", { payload: { text: Schema.String }, success: Schema.String });
+export const Relay = Agent.make("Relay", [Forward, AskEcho, Volley, AskRefuse, FanOut, CrashAfterAnswer, AskKeyed, AskDefectSafe, AskSwallowing]);
 
 // ---------------------------------------------------------------------------
 // Implementations
@@ -95,6 +105,8 @@ export const FlakyLive = Flaky.toLayer(
   Flaky.of({
     // Fails with an undeclared error while attempt <= failTimes: retried.
     FlakyTask: ({ payload, attempt }) =>
+      attempt <= payload.failTimes ? Effect.fail(new Flake({ message: `flake #${attempt}` })) : Effect.succeed({ attempt }),
+    FlakyScheduled: ({ payload, attempt }) =>
       attempt <= payload.failTimes ? Effect.fail(new Flake({ message: `flake #${attempt}` })) : Effect.succeed({ attempt }),
     Refuse: () => Effect.fail(new Nope({ reason: "never" })),
     Die: () => Effect.die(new Error("boom")),
@@ -133,6 +145,15 @@ export const RelayLive = Relay.toLayer(
           concurrency: "unbounded",
         }),
       AskKeyed: ({ payload }) => Effect.map(echoes("keyed").EchoKeyed({ id: payload.id, text: payload.text }), (r) => r.echoed),
+      AskDefectSafe: ({ payload }) =>
+        echoes("asked").EchoText({ text: payload.text }).pipe(
+          Effect.map((r) => r.echoed),
+          Effect.catchDefect(() => Effect.succeed("caught a defect")),
+        ),
+      AskSwallowing: Effect.fn("Relay.AskSwallowing")(function* ({ payload }) {
+        const exit = yield* Effect.exit(echoes("asked").EchoText({ text: payload.text }));
+        return exit._tag === "Success" ? exit.value.echoed : "swallowed";
+      }),
       CrashAfterAnswer: Effect.fn("Relay.CrashAfterAnswer")(function* ({ payload }) {
         const { echoed } = yield* echoes("crash").EchoText({ text: payload.text });
         const runs = yield* Testing.count(`after:${payload.key}`);

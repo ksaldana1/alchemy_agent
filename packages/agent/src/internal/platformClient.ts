@@ -4,10 +4,8 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as HttpBody from "effect/http/HttpBody";
-import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as Layer from "effect/Layer";
-import * as Redacted from "effect/Redacted";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -15,6 +13,8 @@ import type { Workflow } from "effect/workflow";
 import type { Address } from "./core.ts";
 import type { TaskRecord } from "./inbox.ts";
 import type { FileRef } from "./workspace.ts";
+import { HumanRequestView } from "./httpApi.ts";
+import * as ApiClient from "./httpApiClient.ts";
 
 type SuccessOf<W> = W extends Workflow.Workflow<any, any, infer S, any> ? S["Type"] : never;
 type ErrorOf<W> = W extends Workflow.Workflow<any, any, any, infer E> ? E["Type"] : never;
@@ -82,47 +82,63 @@ export class Client extends Context.Service<
 const json = (schema: Schema.Top) => Schema.toCodecJson(schema as Schema.Codec<unknown, unknown, never, never>);
 const POLL = Schedule.spaced("1 second");
 
-export const layer = (options: { readonly url: string; readonly token: string | Redacted.Redacted<string> }) =>
+/** The status each of the API's errors is sent with. */
+const STATUS: Record<string, number> = {
+  BadRequest: 400,
+  Unauthorized: 401,
+  Forbidden: 403,
+  NotFound: 404,
+  Conflict: 409,
+  TaskRefused: 409,
+  Unavailable: 503,
+};
+
+/** Any failure of a call, as a `PlatformError`. Status 0: it never got an answer from the API. */
+const platformError = (e: unknown): PlatformError => {
+  const error = e as { readonly _tag?: string; readonly message?: unknown; readonly error?: unknown };
+  const status = (error._tag !== undefined ? STATUS[error._tag] : undefined) ?? 0;
+  const message = typeof error.message === "string" && error.message !== "" ? error.message : typeof error.error === "string" ? error.error : String(e);
+  return new PlatformError({ status, message });
+};
+
+/** The API's own errors aren't retried; network failures and 5xx are. */
+const call = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, PlatformError, R> =>
+  effect.pipe(
+    Effect.mapError(platformError),
+    Effect.retry({ while: (e) => e.status === 0 || e.status >= 502, schedule: Schedule.exponential("500 millis"), times: 8 }),
+  );
+
+export const layer = (options: ApiClient.ConnectOptions) =>
   Layer.effect(
     Client,
     Effect.gen(function* () {
-      const token = typeof options.token === "string" ? options.token : Redacted.value(options.token);
-      const base = options.url.replace(/\/$/, "");
+      const api = yield* ApiClient.make(options);
+      const raw = yield* ApiClient.rawRequest(options);
       // Streams cover what happened since the client connected (allowing for clock skew).
       const connectedAt = Date.now() - 5_000;
-      const http = (yield* HttpClient.HttpClient).pipe(HttpClient.mapRequest(HttpClientRequest.bearerToken(token)));
 
-      const call = (request: HttpClientRequest.HttpClientRequest): Effect.Effect<any, PlatformError> =>
-        http.execute(request.pipe(HttpClientRequest.prependUrl(base))).pipe(
-          Effect.flatMap((res) =>
-            Effect.flatMap(res.text, (text) => {
-              const body = text === "" ? null : (() => { try { return JSON.parse(text); } catch { return text; } })();
-              if (res.status < 400) return Effect.succeed(body);
-              const message = typeof body === "string" ? body.slice(0, 200) : (body?.message ?? body?.error ?? res.status.toString());
-              // A 404 that isn't the API's own JSON comes from the edge: a fresh workers.dev URL
-              // still converging. Status 0 marks it for a retry.
-              return Effect.fail(new PlatformError({ status: res.status === 404 && typeof body === "string" ? 0 : res.status, message }));
-            }),
+      /** A workspace path in the URL: the typed client can't fill a wildcard path, so these are raw. */
+      const file = (request: HttpClientRequest.HttpClientRequest) =>
+        call(
+          Effect.flatMap(raw(request), (res) =>
+            res.status < 400
+              ? Effect.succeed(res)
+              : Effect.flatMap(res.text, (text) => Effect.fail(new PlatformError({ status: res.status, message: text.slice(0, 200) }))),
           ),
-          Effect.catchTag("HttpClientError", (e) => Effect.fail(new PlatformError({ status: 0, message: e.message }))),
-          // Network failures and the edge not being ready are retried; the API's own errors aren't.
-          Effect.retry({ while: (e) => e.status === 0 || e.status >= 502, schedule: Schedule.exponential("500 millis"), times: 8 }),
         );
-      const get = (path: string) => call(HttpClientRequest.get(path));
-      const post = (path: string, body: unknown) => call(HttpClientRequest.post(path).pipe(HttpClientRequest.setBody(HttpBody.jsonUnsafe(body))));
 
-      const request = (r: any): HumanRequest => ({
+      const request = (r: typeof HumanRequestView.Type): HumanRequest => ({
         ...r,
         respond: (response, opts) =>
           Effect.map(
-            post(`/requests/${encodeURIComponent(r.id)}/respond`, { response, by: opts?.by ?? "platform-client", revision: r.artifact?.revision }),
+            call(api.requests.respond({ params: { id: r.id }, payload: { response, by: opts?.by ?? "platform-client", revision: r.artifact?.revision } })),
             request,
           ),
       });
 
       const run = <W extends Workflow.Any>(workflow: W, executionId: string): Run<W> => {
         const w = workflow as unknown as Workflow.AnyWithProps;
-        const status = Effect.flatMap(get(`/workflows/${w._tag}/runs/${executionId}`), (s: any) => {
+        const status = Effect.flatMap(call(api.workflows.status({ params: { name: w._tag, executionId } })), (s) => {
           if (s._tag === "Completed") return Effect.map(Schema.decodeUnknownEffect(json(w.successSchema))(s.result).pipe(Effect.orDie), (result) => ({ _tag: "Completed", result }));
           if (s._tag === "Failed") return Effect.map(Schema.decodeUnknownEffect(json(w.errorSchema))(s.error).pipe(Effect.orDie), (error) => ({ _tag: "Failed", error }));
           return Effect.succeed(s);
@@ -142,19 +158,20 @@ export const layer = (options: { readonly url: string; readonly token: string | 
             ),
           ) as never,
           tasksOn: (agent) =>
-            Effect.map(get(`/agents/${encodeURIComponent(agent.type)}/${encodeURIComponent(agent.name)}/tasks?limit=500`), (ts: ReadonlyArray<TaskRecord>) =>
+            Effect.map(call(api.agents.tasks({ params: { type: agent.type, name: agent.name }, query: { limit: 500 } })), (ts) =>
               ts.filter((t) => t.causation === `workflow/${w._tag}/${executionId}`),
             ),
         };
       };
 
+      type LogEntry = { seq: number; at: number; kind: string; detail: string };
       /** The listener log after `after`, all pages. */
       const logAfter = (after: number) =>
         Effect.gen(function* () {
-          const out: Array<{ seq: number; at: number; kind: string; detail: string }> = [];
+          const out: Array<LogEntry> = [];
           let cursor = after;
           for (;;) {
-            const page = (yield* get(`/listeners/log?after=${cursor}`)) as ReadonlyArray<{ seq: number; at: number; kind: string; detail: string }>;
+            const page = (yield* call(api.listeners.log({ query: { after: cursor } }))) as ReadonlyArray<LogEntry>;
             out.push(...page);
             if (page.length < 500) return out;
             cursor = page.at(-1)!.seq;
@@ -169,27 +186,32 @@ export const layer = (options: { readonly url: string; readonly token: string | 
         );
       };
 
+      const pending = call(api.requests.list({ query: { status: "pending" } }));
+
       return Client.of({
         files: {
-          write: (path, text) => call(HttpClientRequest.put(`/workspace/files/${path}`).pipe(HttpClientRequest.setBody(HttpBody.text(text)))),
-          read: (path) => Effect.map(get(`/workspace/files/${path}`), String),
+          write: (path, text) =>
+            Effect.flatMap(file(HttpClientRequest.put(`/workspace/files/${path}`).pipe(HttpClientRequest.setBody(HttpBody.text(text)))), (res) =>
+              call(Effect.flatMap(res.json, Schema.decodeUnknownEffect(FileRefSchema))),
+            ),
+          read: (path) => Effect.flatMap(file(HttpClientRequest.get(`/workspace/files/${path}`)), (res) => call(res.text)),
         },
         requests: {
-          pending: Effect.map(get(`/requests?status=pending`), (rs: ReadonlyArray<any>) => rs.map(request)),
+          pending: Effect.map(pending, (rs) => rs.map(request)),
           // Requests made since this client connected.
           stream: watch(
-            Effect.map(get(`/requests?status=pending`), (rs: ReadonlyArray<any>) => rs.filter((r) => r.createdAt >= connectedAt).map(request)),
+            Effect.map(pending, (rs) => rs.filter((r) => r.createdAt >= connectedAt).map(request)),
             (r) => r.id,
           ),
         },
         listeners: {
-          replay: (message) => Effect.asVoid(post(`/listeners/events`, { message })),
+          replay: (message) => Effect.asVoid(call(api.listeners.replay({ payload: { message } }))),
         },
         start: (workflow, payload) =>
           Effect.gen(function* () {
             const w = workflow as unknown as Workflow.AnyWithProps;
             const encoded = yield* Schema.encodeUnknownEffect(json(w.payloadSchema))(payload).pipe(Effect.orDie);
-            const { executionId } = yield* post(`/workflows/${w._tag}/runs`, { payload: encoded });
+            const { executionId } = yield* call(api.workflows.start({ params: { name: w._tag }, payload: { payload: encoded } }));
             return run(workflow, executionId);
           }),
         run,
@@ -212,3 +234,5 @@ export const layer = (options: { readonly url: string; readonly token: string | 
       });
     }),
   );
+
+const FileRefSchema = Schema.Struct({ path: Schema.String, revision: Schema.String, size: Schema.Number });

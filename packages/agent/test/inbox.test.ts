@@ -182,6 +182,19 @@ test(
 );
 
 test(
+  "a Schedule as the retry policy: it decides the delays and when retries end",
+  viaApi(
+    Effect.gen(function* () {
+      const flaky = yield* Flaky.client;
+      expect(yield* flaky(`sched-${run}`).FlakyScheduled({ failTimes: 4 })).toEqual({ attempt: 5 });
+      const error = yield* Effect.flip(flaky(`sched-out-${run}`).FlakyScheduled({ failTimes: 9 }));
+      expect(error.reason).toMatchObject({ _tag: "RetriesExhausted", attempts: 5, lastError: "flake #5" });
+    }),
+  ),
+  timeout,
+);
+
+test(
   "a declared error settles the task on the first attempt and reaches the caller as itself",
   viaApi(
     Effect.gen(function* () {
@@ -291,6 +304,20 @@ test(
     Effect.gen(function* () {
       const path = yield* (yield* Relay.client)(`v-${run}-a`).Volley({ n: 4, path: [] });
       expect(path).toEqual([`v-${run}-a`, `v-${run}-b`, `v-${run}-a`, `v-${run}-b`, `v-${run}-a`]);
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "a wait passes through catchDefect, and code that catches it can't turn it into an answer",
+  viaApi(
+    Effect.gen(function* () {
+      const relay = (yield* Relay.client)(`suspend-${run}`);
+      expect(yield* relay.AskDefectSafe({ text: "safe" })).toBe("SAFE");
+      // The first run's Effect.exit sees the interruption and returns "swallowed"; that outcome is
+      // discarded, and the rerun gets the answer.
+      expect(yield* relay.AskSwallowing({ text: "swallow" })).toBe("SWALLOW");
     }),
   ),
   timeout,
@@ -407,7 +434,7 @@ test(
       expect(yield* record("Echo", name, "slow")).toMatchObject({ status: "failed", error: { reason: { _tag: "Canceled" } } });
       // An unknown task is an error.
       const missing = yield* Effect.flip(Agent.cancel(Echo.address(name), "nope"));
-      expect(missing.reason._tag).toBe("Unreachable");
+      expect(missing.reason).toMatchObject({ _tag: "TaskNotFound", taskId: "nope" });
     }),
   ),
   { timeout: 90_000 },

@@ -18,7 +18,7 @@ import type * as Layer from "effect/Layer";
 import type * as Schema from "effect/Schema";
 import type { Rpc } from "effect/rpc";
 import { makeClient, type AgentClient, type AgentContract, type AgentRpc } from "./internal/client.ts";
-import { AgentError, Agents, Generating, Unreachable, type Address, type AgentContext, type ExternalTask, type GenerationError, type RetryPolicy } from "./internal/core.ts";
+import { AgentError, Agents, Generating, TaskNotFound, type Address, type AgentContext, type ExternalTask, type GenerationError, type RetryPolicy } from "./internal/core.ts";
 import { agentObject, type Handler } from "./internal/runtime.ts";
 import type { Limits } from "./internal/session.ts";
 
@@ -38,11 +38,13 @@ export {
   Retry,
   RetriesExhausted,
   StepLimit,
+  TaskNotFound,
   TokenBudget,
   ToolCall,
   UnknownTask,
   Unreachable,
   WaitingInHandler,
+  type RetryOptions,
   type RetryPolicy,
   type Transport,
 } from "./internal/core.ts";
@@ -203,7 +205,7 @@ export const generate = <S extends Schema.Codec<any, any, never, never> = typeof
  * is interrupted, and nothing it does afterwards is recorded.
  *
  * Succeeds with `true` if this call canceled the task, `false` if it had already settled. An
- * unknown task fails with `AgentError(Unreachable)`. A keyed task's id is `<Tag>:<primaryKey>`.
+ * unknown task fails with `AgentError(TaskNotFound)`. A keyed task's id is `<Tag>:<primaryKey>`.
  */
 export const cancel = (
   agent: Address,
@@ -213,7 +215,7 @@ export const cancel = (
   Effect.flatMap(Effect.service(Agents), (agents) =>
     Effect.flatMap(agents.transport(agent).cancel(taskId, options?.reason ?? ""), ({ canceled, record }) =>
       record === null
-        ? Effect.fail(new AgentError({ agent, reason: new Unreachable({ message: `no task ${taskId}` }) }))
+        ? Effect.fail(new AgentError({ agent, reason: new TaskNotFound({ taskId }) }))
         : Effect.succeed(canceled),
     ),
   );

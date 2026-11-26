@@ -7,7 +7,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { callAgent } from "./client.ts";
-import { AgentErrorReason, Calls, Suspend, Unreachable, type Address, type CallRequest } from "./core.ts";
+import { AgentErrorReason, Calls, makeSuspension, suspend, Unreachable, type Address, type CallRequest, type Suspension } from "./core.ts";
 import * as Inbox from "./inbox.ts";
 import { WORKFLOW_PREFIX } from "./workflow.ts";
 
@@ -93,11 +93,11 @@ export const makeOutbox = (deps: OutboxDeps) => {
   // ---- Calls made by one execution -------------------------------------------------------
 
   /**
-   * The `Calls` service for one execution of a handler or tool, and `flush`, which records the
-   * new calls. Run `flush` in the transaction that records the execution's outcome: a failed
+   * The `Calls` service for one execution of a handler or tool, `flush`, which records the new
+   * calls, and the execution's `suspension` (set when a waiting call suspends it). Run `flush` in the transaction that records the execution's outcome: a failed
    * execution's calls are dropped, and the rerun makes them again.
    */
-  const calls = (owner: Owner) => {
+  const calls = (owner: Owner, suspension: Suspension = makeSuspension()) => {
     let index = 0;
     const buffered: Array<CallRequest & { readonly id: string; readonly taskId: string }> = [];
     const service = Calls.of({
@@ -122,13 +122,13 @@ export const makeOutbox = (deps: OutboxDeps) => {
             }
             if (!request.wait) return undefined;
             if (existing.status === "settled") return JSON.parse(existing.record!) as Inbox.TaskRecord;
-            return yield* Effect.die(new Suspend(id));
+            return yield* suspend(suspension, id);
           }
           buffered.push({ ...request, id, taskId: request.taskId ?? `${self.type}/${self.name}/${id}` });
           if (!request.wait) return undefined;
           // Calls started alongside this one (`Effect.all`) get to record theirs before it suspends.
           yield* Effect.yieldNow;
-          return yield* Effect.die(new Suspend(id));
+          return yield* suspend(suspension, id);
         }) as Effect.Effect<Inbox.TaskRecord | undefined, never, RuntimeContext> as Effect.Effect<Inbox.TaskRecord | undefined>,
     });
     const flush = Effect.gen(function* () {
@@ -156,7 +156,7 @@ export const makeOutbox = (deps: OutboxDeps) => {
       buffered.length = 0;
       yield* scheduleDelivery(now());
     });
-    return { service, flush };
+    return { service, flush, suspension };
   };
 
   // ---- Delivery (the durable callback) --------------------------------------------------

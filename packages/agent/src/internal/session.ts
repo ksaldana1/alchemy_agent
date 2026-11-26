@@ -16,7 +16,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as SchemaRepresentation from "effect/SchemaRepresentation";
 import * as Stream from "effect/Stream";
-import { AgentContext, Calls, CurrentExecution, GenerationError, ModelError, StepLimit, Suspend, TokenBudget, ToolCall } from "./core.ts";
+import { AgentContext, Calls, CurrentExecution, GenerationError, ModelError, StepLimit, TokenBudget, ToolCall, type Suspension } from "./core.ts";
 import { advanceCursor, type Sql } from "./inbox.ts";
 
 export interface Limits {
@@ -101,7 +101,12 @@ export interface SessionDeps {
   readonly callsFor: (
     turn: { readonly id: string; readonly task_id: string },
     toolCallId: string,
-  ) => { readonly service: Context.Service.Shape<typeof Calls>; readonly flush: Effect.Effect<void, never, RuntimeContext> };
+  ) => {
+    readonly service: Context.Service.Shape<typeof Calls>;
+    readonly flush: Effect.Effect<void, never, RuntimeContext>;
+    /** Set when a waiting call suspends the tool. */
+    readonly suspension: Suspension;
+  };
 }
 
 export const makeSessions = (deps: SessionDeps) => {
@@ -289,7 +294,7 @@ export const makeSessions = (deps: SessionDeps) => {
       toolCallId: call.id,
       idempotencyKey: `${turn.session_id}/${turn.id}/${call.id}`,
     });
-    return yield* Effect.gen(function* () {
+    const exit = yield* Effect.gen(function* () {
       const handled = yield* (deps.toolkit as Toolkit.Toolkit<Record<string, Tool.Any>>);
       const results = yield* handled.handle(call.name as never, call.params as never, call.id).pipe(Effect.flatMap(Stream.runCollect));
       const last = [...results].at(-1);
@@ -301,10 +306,15 @@ export const makeSessions = (deps: SessionDeps) => {
       // Agent calls in a tool go through the outbox; a waiting one suspends the turn.
       Effect.provideService(Calls, calls.service),
       Effect.catch((e) => Effect.succeed(fail(AiError.isAiError(e) ? e.message : String((e as { message?: unknown })?.message ?? e)))),
-      Effect.catchDefect((d) =>
-        Effect.succeed(d instanceof Suspend ? ("suspended" as const) : fail(d instanceof Error ? d.message : String(d))),
-      ),
+      Effect.catchDefect((d) => Effect.succeed(fail(d instanceof Error ? d.message : String(d)))),
+      Effect.exit,
     );
+    // A waiting call suspended the tool (it interrupted itself): the turn waits, whatever the tool
+    // made of the interruption.
+    if (calls.suspension.waitingOn !== undefined) return "suspended" as const;
+    // Any other interruption (the turn's execution is being torn down) isn't a tool result.
+    if (exit._tag === "Failure") return yield* Effect.failCause(exit.cause);
+    return exit.value;
   });
 
   const callModel = (turn: TurnRow, spec: OutputSpec, rows: ReadonlyArray<MessageRow>, forceRespond: boolean) => {

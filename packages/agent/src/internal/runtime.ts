@@ -12,6 +12,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import type * as Schedule from "effect/Schedule";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
@@ -36,13 +37,15 @@ import {
   ModelError,
   Retry,
   RetriesExhausted,
-  Suspend,
+  suspend,
   UnknownTask,
   type Address,
   type GenerateRequest,
   type RetryPolicy,
+  type Suspension,
 } from "./core.ts";
 import * as Inbox from "./inbox.ts";
+import * as RetrySchedule from "./retry.ts";
 import { makeOutbox, type Outbox } from "./outbox.ts";
 import { makeSessions, type Limits, type OutputSpec } from "./session.ts";
 import { signalWorkflow } from "./workflow.ts";
@@ -50,7 +53,6 @@ import { reportSeen } from "./registry.ts";
 import { WorkflowEngine } from "effect/workflow";
 import { DeferredModel } from "../AgentModel.ts";
 
-const DEFAULT_RETRY = { maxAttempts: 3, delay: "1 second", maxDelay: "5 minutes" } as const;
 /** Tasks run per drain pass before it reschedules itself, so one pass stays short. */
 const DRAIN_BATCH = 10;
 const DRAIN_CALLBACK = "alchemy-agent/drain";
@@ -70,7 +72,13 @@ export type Handler = (request: {
 type Outcome =
   | { readonly _tag: "Completed"; readonly result: unknown }
   | { readonly _tag: "Suspended" }
-  | { readonly _tag: "Failed"; readonly permanent: boolean; readonly error: Inbox.StoredFailure };
+  | {
+      readonly _tag: "Failed";
+      readonly permanent: boolean;
+      readonly error: Inbox.StoredFailure;
+      /** The error or defect itself: the retry schedule's input. */
+      readonly failure?: unknown;
+    };
 /** An execution's outcome, and the calls it made (recorded only if it completed or suspended). */
 type Executed = { readonly outcome: Outcome; readonly flush: Effect.Effect<void, never, RuntimeContext> };
 
@@ -105,19 +113,26 @@ export const agentObject = (config: HostConfig) => {
   const { contract } = config;
   const type = contract.type;
   // The agent's policy, overridden per task by an `Agent.Retry` annotation on its Rpc.
-  const policyOf = (tag: string) => {
-    const rpc = contract.rpcs.get(tag);
-    const p = { ...DEFAULT_RETRY, ...config.retry, ...(rpc ? Context.get(rpc.annotations, Retry) : undefined) };
-    return {
-      maxAttempts: p.maxAttempts,
-      delayMs: Duration.toMillis(Duration.fromInputUnsafe(p.delay)),
-      maxDelayMs: Duration.toMillis(Duration.fromInputUnsafe(p.maxDelay)),
-    };
+  const schedules = new Map<string, Schedule.Schedule<any, unknown>>();
+  const scheduleOf = (tag: string) => {
+    let schedule = schedules.get(tag);
+    if (schedule === undefined) {
+      const rpc = contract.rpcs.get(tag);
+      schedule = RetrySchedule.resolve([config.retry, rpc ? Context.get(rpc.annotations, Retry) : undefined]);
+      schedules.set(tag, schedule);
+    }
+    return schedule;
   };
-  const backoff = (tag: string, attempts: number) => {
-    const p = policyOf(tag);
-    return Math.min(p.maxDelayMs, p.delayMs * 2 ** Math.max(0, attempts - 1));
-  };
+  const attemptCaps = new Map<string, number>();
+  /** Deliveries a task allows (stored with it: lost executions count against it too). */
+  const maxAttemptsOf = (tag: string) =>
+    Effect.suspend(() => {
+      const known = attemptCaps.get(tag);
+      if (known !== undefined) return Effect.succeed(known);
+      return Effect.tap(RetrySchedule.maxAttempts(scheduleOf(tag)), (n) => Effect.sync(() => attemptCaps.set(tag, n)));
+    });
+  /** The delay before the next delivery after failed attempt `attempts`, or undefined: no more. */
+  const backoff = (tag: string, attempts: number, failure: unknown) => RetrySchedule.delayAfter(scheduleOf(tag), attempts, failure);
   const retentionMs = config.retention === undefined ? undefined : Duration.toMillis(Duration.fromInputUnsafe(config.retention));
 
   return Effect.gen(function* () {
@@ -220,7 +235,7 @@ export const agentObject = (config: HostConfig) => {
       });
 
       /** `Agent.generate` in a handler: the i-th call of a task is turn `<taskId>#<i>`. */
-      const generating = (row: Inbox.InboxRow) => {
+      const generating = (row: Inbox.InboxRow, suspension: Suspension) => {
         let index = 0;
         return Generating.of({
           run: (request: GenerateRequest) =>
@@ -241,9 +256,9 @@ export const agentObject = (config: HostConfig) => {
                   }),
                 );
                 for (const e of events) yield* sessions.emit(sessionId, e);
-                return yield* Effect.die(new Suspend(turnId));
+                return yield* suspend(suspension, turnId);
               }
-              if (settled === "pending") return yield* Effect.die(new Suspend(turnId));
+              if (settled === "pending") return yield* suspend(suspension, turnId);
               if (settled.status === "failed") return yield* Effect.fail(settled.error!);
               if (request.schema === undefined) return settled.output;
               return yield* Schema.decodeUnknownEffect(request.schema)(settled.output).pipe(
@@ -263,7 +278,7 @@ export const agentObject = (config: HostConfig) => {
           waitUntil: (at) =>
             Effect.suspend(() => {
               wakeAt = at;
-              return Effect.die(new Suspend(row.task_id));
+              return suspend(calls.suspension, row.task_id);
             }),
         });
         // Recorded with the outcome: the calls made, and the wake-up, in the same transaction.
@@ -271,7 +286,7 @@ export const agentObject = (config: HostConfig) => {
           calls.flush,
           Effect.suspend(() => (wakeAt === null ? Effect.void : scheduleWake(row.task_id, wakeAt))),
         );
-        return Effect.map(run(row, attempt, calls.service, external), (outcome) => ({ outcome, flush }));
+        return Effect.map(run(row, attempt, calls.service, external, calls.suspension), (outcome) => ({ outcome, flush }));
       };
 
       const run = Effect.fnUntraced(function* (
@@ -279,6 +294,7 @@ export const agentObject = (config: HostConfig) => {
         attempt: number,
         calls: Context.Service.Shape<typeof Calls>,
         external: Context.Service.Shape<typeof ExternalTask>,
+        suspension: Suspension,
       ) {
         const rpc: Rpc.AnyWithProps | undefined = contract.rpcs.get(row.task);
         const handler = handlers[row.task];
@@ -298,7 +314,7 @@ export const agentObject = (config: HostConfig) => {
           }
         }
         let services = Context.merge(context, Context.make(AgentContext, { agent, taskId: row.task_id, attempt }));
-        if (hasModel) services = Context.add(services, Generating, generating(row));
+        if (hasModel) services = Context.add(services, Generating, generating(row, suspension));
         // Forked so `cancel` can interrupt it. Its outcome is then discarded: the cancel settled the task.
         const fiber = yield* handler({ payload: payload.success, taskId: row.task_id, attempt, agent }).pipe(
           Effect.provideContext(services as Context.Context<unknown>),
@@ -311,6 +327,21 @@ export const agentObject = (config: HostConfig) => {
         );
         inflight.set(row.task_id, fiber);
         const exit = yield* Effect.exit(Fiber.join(fiber)).pipe(Effect.ensuring(Effect.sync(() => inflight.delete(row.task_id))));
+        // It reached an unfinished turn or call: the task waits, whatever the handler made of the
+        // interruption (code that caught it ran on without the answer; its outcome is discarded).
+        if (suspension.waitingOn !== undefined) {
+          if (exit._tag === "Success" || !Cause.hasInterruptsOnly(exit.cause)) {
+            yield* Effect.logWarning("task.suspension-caught").pipe(
+              Effect.annotateLogs({
+                agent: `${type}/${agent.name}`,
+                taskId: row.task_id,
+                waitingOn: suspension.waitingOn,
+                hint: "catchCause/exit around an agent call or Agent.generate caught its suspension; that outcome is discarded",
+              }),
+            );
+          }
+          return { _tag: "Suspended" } as Outcome;
+        }
         if (exit._tag === "Success") {
           const encoded = yield* Schema.encodeUnknownEffect(json(rpc.successSchema))(exit.value).pipe(Effect.orDie);
           return { _tag: "Completed", result: encoded } as Outcome;
@@ -335,29 +366,28 @@ export const agentObject = (config: HostConfig) => {
           }
           // A workspace denial fails the same way on every rerun (grants don't change on retry).
           if ((e as object) instanceof FsDenied) return { _tag: "Failed", permanent: true, error: agentFailure(e as FsDenied) } as Outcome;
-          return { _tag: "Failed", permanent: false, error: { kind: "attempt", message: messageOf(e) } } as Outcome;
+          return { _tag: "Failed", permanent: false, error: { kind: "attempt", message: messageOf(e) }, failure: e } as Outcome;
         }
         const defect = Cause.findDefect(exit.cause);
-        if (defect._tag === "Success" && defect.success instanceof Suspend) return { _tag: "Suspended" } as Outcome;
         return {
           _tag: "Failed",
           permanent: false,
           error: { kind: "attempt", message: defect._tag === "Success" ? messageOf(defect.success) : "the handler was interrupted" },
+          failure: defect._tag === "Success" ? defect.success : undefined,
         } as Outcome;
       });
 
-      // A failed attempt either settles the task or puts it back with a backoff.
-      const afterFailure = (row: Inbox.InboxRow, attempts: number, error: Inbox.StoredFailure, permanent: boolean) =>
-        permanent
-          ? Inbox.fail(sql, row.seq, error, now())
-          : attempts >= row.max_attempts
-            ? Inbox.fail(
-                sql,
-                row.seq,
-                agentFailure(new RetriesExhausted({ attempts, lastError: error.kind === "attempt" ? error.message : "" })),
-                now(),
-              )
-            : Inbox.retryLater(sql, row.seq, error, now() + backoff(row.task, attempts));
+      // A failed attempt either settles the task or puts it back after the schedule's delay.
+      const afterFailure = (row: Inbox.InboxRow, attempts: number, error: Inbox.StoredFailure, permanent: boolean, failure: unknown) =>
+        Effect.gen(function* () {
+          if (permanent) return yield* Inbox.fail(sql, row.seq, error, now());
+          const delay = attempts >= row.max_attempts ? undefined : yield* backoff(row.task, attempts, failure);
+          if (delay === undefined) {
+            const lastError = error.kind === "attempt" ? error.message : "";
+            return yield* Inbox.fail(sql, row.seq, agentFailure(new RetriesExhausted({ attempts, lastError })), now());
+          }
+          return yield* Inbox.retryLater(sql, row.seq, error, now() + delay);
+        });
 
       /**
        * Retention: removes up to a batch of tasks that settled before `before`, with their turns,
@@ -380,11 +410,13 @@ export const agentObject = (config: HostConfig) => {
         // The drain is single-flight per Durable Object, so a `running` row at the start of a
         // pass belongs to an execution that ended without settling it: a lost attempt.
         for (const row of yield* Inbox.running(sql)) {
+          const lost = new ExecutionLost({ attempts: row.attempts });
+          const delay = row.attempts >= row.max_attempts ? undefined : yield* backoff(row.task, row.attempts, lost);
           yield* transaction(
             Effect.andThen(
-              row.attempts >= row.max_attempts
-                ? Inbox.fail(sql, row.seq, agentFailure(new ExecutionLost({ attempts: row.attempts })), now())
-                : Inbox.retryLater(sql, row.seq, { kind: "attempt", message: "the execution running this task ended" }, now() + backoff(row.task, row.attempts)),
+              delay === undefined
+                ? Inbox.fail(sql, row.seq, agentFailure(lost), now())
+                : Inbox.retryLater(sql, row.seq, { kind: "attempt", message: "the execution running this task ended" }, now() + delay),
               outbox.notify(row.task_id),
             ),
           );
@@ -407,7 +439,7 @@ export const agentObject = (config: HostConfig) => {
               if ((yield* Inbox.get(sql, row.task_id))?.status !== "running") return;
               if (result._tag === "Completed") yield* Effect.andThen(Inbox.complete(sql, row.seq, result.result, now()), flush);
               else if (result._tag === "Suspended") yield* Effect.andThen(Inbox.suspend(sql, row.seq), flush);
-              else yield* afterFailure(row, attempt, result.error, result.permanent);
+              else yield* afterFailure(row, attempt, result.error, result.permanent, result.failure);
               yield* outbox.notify(row.task_id);
             }),
           );
@@ -469,7 +501,7 @@ export const agentObject = (config: HostConfig) => {
                 taskId,
                 task: tag,
                 input: payload,
-                maxAttempts: policyOf(tag).maxAttempts,
+                maxAttempts: yield* maxAttemptsOf(tag),
                 causation: options.causation,
                 now: now(),
                 ...(failure ? { failure } : {}),

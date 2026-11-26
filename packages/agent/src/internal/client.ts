@@ -18,7 +18,9 @@ import {
   AgentErrorReason,
   bindingTransportRef,
   Calls,
+  InvalidPayload,
   RetriesExhausted,
+  TaskNotFound,
   Unreachable,
   type Address,
   type Transport,
@@ -90,7 +92,7 @@ const awaitSettled = (transport: Transport, agent: Address, taskId: string) =>
         ? Effect.fail(
             new AgentError({
               agent,
-              reason: new Unreachable({ message: `no task ${taskId}` }),
+              reason: new TaskNotFound({ taskId }),
             }),
           )
         : Effect.succeed(r),
@@ -114,9 +116,7 @@ export const makeClient = <Rpcs extends Rpc.Any>(contract: AgentContract, agent:
           (e) =>
             new AgentError({
               agent,
-              reason: new Unreachable({
-                message: `invalid payload: ${e.message}`,
-              }),
+              reason: new InvalidPayload({ message: e.message }),
             }),
         ),
       );

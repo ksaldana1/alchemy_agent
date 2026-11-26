@@ -328,11 +328,18 @@ export const Welcome = Rpc.make("Welcome", {
 ```
 
 **Retries.** The defaults are 3 attempts, a 1 s delay that doubles, and a 5 min cap. Override
-them per agent (`toLayer(…, { retry })`) or per task with an annotation:
+them per agent (`toLayer(…, { retry })`) or per task with an annotation, either with that
+shorthand or with any Effect `Schedule`, as you would give `Effect.retry`:
 
 ```ts
 Rpc.make("Sync", { … }).annotate(Agent.Retry, { delay: "30 seconds", maxAttempts: 10 })
+Rpc.make("Fetch", { … }).annotate(Agent.Retry, Schedule.exponential("1 second").pipe(Schedule.jittered, Schedule.upTo({ times: 5 })))
 ```
+
+A schedule is stepped once per failure, with the failure as its input, and the task fails with
+`RetriesExhausted` when it ends. Retries outlive executions, so no schedule state is kept: each
+failure replays the schedule from its start on a clock that advances by its own delays. A
+schedule that never ends stops after 100 attempts.
 
 **Cancellation.** `Agent.cancel(address, taskId, { reason })` settles a task that hasn't settled
 as `AgentError(Canceled)`, which is what anyone waiting for it gets. A running handler is
@@ -376,7 +383,7 @@ the platform can't deliver is one `AgentError` with a tagged `reason`:
 ```ts
 yield* reviewers("junior").Review({ path }).pipe(
   Effect.catchTag("FsDenied", () => reviewers("senior").Review({ path })), // declared by Review
-  Effect.catchTag("AgentError", (e) => …), // e.reason: Unreachable | RetriesExhausted | Canceled | InputConflict | …
+  Effect.catchTag("AgentError", (e) => …), // e.reason: Unreachable | RetriesExhausted | TaskNotFound | Canceled | InputConflict | …
 );
 ```
 
@@ -637,7 +644,10 @@ Worker. It hosts every agent's Durable Object, the workflow engine, the workspac
 declare grants or file listeners), the listeners' queues, and the HTTP API. If you write your own
 Worker, `Platform.layer({ … })` is the same thing as a Layer, and `Api.routes()` mounts the API.
 
-Every route needs `Authorization: Bearer <AGENT_API_TOKEN>`.
+Every route needs `Authorization: Bearer <AGENT_API_TOKEN>`. The API is an Effect `HttpApi`,
+exported as `Api.Definition`: build an OpenAPI document from it (`OpenApi.fromApi`), or a typed
+client of your own (`HttpApiClient.make(Api.Definition, …)`), which is what `Api.connect` and
+`Platform.connect` use. Errors are JSON with an `error` field and a `_tag`.
 
 | Route | What it does |
 |---|---|
@@ -750,9 +760,11 @@ test("greets", Effect.gen(function* () {
   identified by their position. A run that makes a different call at the same position stops
   with an error instead of getting another call's answer. Don't branch on time or randomness
   before a call.
-- **Don't catch defects** (`catchCause`, `catchDefect`, `exit`) around client calls,
-  `Agent.generate`, or `Human.*`. Waiting is signaled as a defect that the runtime needs to see.
-  Catching typed errors (`catchTag`) is fine.
+- **Waiting interrupts the handler.** A client call, `Agent.generate`, or `Human.*` that has to
+  wait suspends the execution by interrupting it, as `effect/workflow` does, so `catch`,
+  `catchTag`, `catchDefect`, `orElse`, and `retry` never see it. Once an execution has suspended,
+  its outcome is discarded: code that catches the interruption (`catchCause`, `exit`) runs on for
+  nothing, and its side effects can repeat. Keep those away from agent calls.
 - **Don't call agents inside an `Activity`.** Call them from the workflow body, where each call
   is its own step.
 - **Redeploys are gradual.** A Durable Object can run the previous code for a few minutes after

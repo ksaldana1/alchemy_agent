@@ -525,6 +525,14 @@ Changes and gaps, and why:
 - **Not done:** the Anthropic reviewer through `AgentModel.gateway` (needs a key), `HttpApi`
   for the HTTP API, and a push feed (the client polls).
 
+## Spike 0.7 (after M8, 2026-11-26): Effect's Cloudflare cluster
+
+Should agents be `effect/cluster` entities on `@effect/platform-cloudflare`? **No, borrow
+instead** ([0.7](spike/0.7-effect-cloudflare-cluster.md)). Its persisted requests can't wait
+without a 30 s heartbeat and a replay on every wake, its tells have no outbox, and its mailbox
+can't commit with our state. D2–D4 and D7 stand. Next: probe `@effect/sql-sqlite-do` as our
+storage, and an in-memory test layer modeled on `Entity.makeTestClient`.
+
 ## Later
 
 - Generated agents through Worker Loader (`globalOutbound: null`) with a scoped ctx

@@ -34,9 +34,10 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   should look like Effect's, not like a framework of its own.
 - Inside an agent (handler or tool), client calls go through the outbox and are identified by
   their position (`<owner>#c<n>`). A handler must make the same calls in the same order on every
-  run, and code before a waiting call can run more than once. Don't catch defects
-  (`catchCause`, `catchDefect`, `exit`) around client calls or `Agent.generate`: waiting is a
-  defect the runtime has to see.
+  run, and code before a waiting call can run more than once. A waiting call or
+  `Agent.generate` suspends by interrupting itself (as `effect/workflow` does); once it has, the
+  execution's outcome is discarded, so code that catches the interruption (`catchCause`, `exit`)
+  runs on for nothing. Framework code suspends only through `suspend()` in `internal/core.ts`.
 - Workflows are plain `effect/workflow` on Alchemy's Durable Object engine (D9). `Workflow.make(name, options)`
   takes the name first in Effect 4.1. Call agents from the workflow body, never inside an `Activity`.
   Host agents and workflows together with `Platform.layer` / `Platform.make`, which gives the engine

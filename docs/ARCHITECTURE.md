@@ -124,7 +124,8 @@ reach the caller as themselves, so `catchTag` works across agents. Everything el
 reports is one `AgentError { agent, reason }`, where the reason is a tagged union: `Unreachable`,
 `ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`,
 `FsDenied` (an undeclared workspace denial, never retried), `InputConflict` (the task id is taken
-by another task or payload), `Canceled`. (Records
+by another task or payload), `Canceled`, `TaskNotFound` (no task with this id, or it was pruned).
+`Unreachable` means only that: the agent couldn't be reached. (Records
 from before M3 can also carry `WaitingInHandler`, which nothing produces any more.) An undeclared
 failure is retried up to the attempt cap.
 
@@ -147,9 +148,12 @@ of its follow-up commit together.
 2. Up to 10 due rows, FIFO. For each: mark `running` and increment `attempts` (committed
    before the handler runs), run the handler, then commit one of: `completed` with the result,
    `failed` (a declared error, a failed generation, or the attempt cap), `waiting` (the handler
-   reached an unfinished LLM turn), or `pending` with `run_at = now + delay × 2^(attempts−1)`.
-   The policy is the defaults, then the agent's `retry`, then the task's `Agent.Retry`
-   annotation.
+   reached an unfinished LLM turn), or `pending` with `run_at = now + ` the
+   retry schedule's delay. The schedule is the task's `Agent.Retry`, else the agent's `retry`, else
+   the default (shorthand options merge over each other and the defaults). It's replayed from its
+   start for each failure, with the failure as input, and the task fails when it ends or after 100
+   attempts (`internal/retry.ts`). A row's `max_attempts` is the schedule's length, which also caps
+   lost executions.
 3. If any row is still pending, reschedule the drain at the earliest `run_at`, passing an
    increasing cursor as `progress`. Without it, Alchemy counts each reschedule as a retry.
 
@@ -370,11 +374,20 @@ human requests by state.
 
 ## From outside, and under test (M8)
 
+**The HTTP API** is an `HttpApi` (`internal/httpApi.ts`, exported as `Api.Definition`): five
+groups (agents, workspace, workflows, listeners, requests) behind a bearer-token middleware, with
+tagged errors carrying their status. `Api.routes` builds it once per isolate with
+`HttpRouter.toHttpEffect` (and `alchemy/Http`'s `Platform` services); a route the API doesn't have
+falls through (`undefined`) to the Worker's own routes. Every response the API sends carries
+`x-alchemy-agent`, so a client can tell an edge 404 from the API's. Both clients are
+`HttpApiClient`s of the same definition (`internal/httpApiClient.ts`), except for workspace file
+paths, which the typed client can't fill (wildcard routes), so those requests are raw.
+
 **`Platform.connect({ url, token })`** provides `Platform.Client` and routes agent clients over
 HTTP. Its streams poll the API: `requests.stream` emits each pending human request made since
 the client connected, and `runs(workflow)` emits each run listeners started since then, read
-from the listener log. Network failures, 502–504, and a 404 from the edge (not the API's own
-JSON) are retried. `Platform.make` turns a defect while handling a request into a 503 with its
+from the listener log. Network failures, 502–504, and a 404 from the edge (one without the
+`x-alchemy-agent` header) are retried. `Platform.make` turns a defect while handling a request into a 503 with its
 message.
 
 **Chaos.** `Testing.crashOnce(Agent, "Task")` rules, provided with
@@ -394,8 +407,14 @@ schema.
 up turn `<taskId>#<n>`. A finished turn returns its answer, decoded with the schema (default
 `Schema.String`). Otherwise, in one transaction, the turn is
 recorded and started if its session is free (the user message is appended and the first step
-scheduled). The handler then suspends (a defect, so handler error handling can't swallow it),
-and the task becomes `waiting`.
+scheduled). The handler then suspends, and the task becomes `waiting`.
+
+**Suspension** works like `effect/workflow`'s: the execution (a handler run, or one tool call)
+records what it waits on in its `Suspension` and fails with an interrupt cause (`Effect.interrupt`),
+which typed-error and defect handlers don't catch. The runtime checks the `Suspension`, not the
+exit: once it's set, the execution is suspended whatever it returned. A handler that caught the
+interruption and answered anyway has that answer discarded, and the runtime logs
+`task.suspension-caught`. A cancel also interrupts, but sets no `Suspension`.
 
 **A step** (durable callback `alchemy-agent/step`, job id = turn id) does exactly one of:
 - One model call with tool resolution disabled and deferred argument validation, persisted as a

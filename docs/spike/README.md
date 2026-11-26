@@ -12,6 +12,7 @@ has its own doc here. **When all of them are done, stop and revisit D1–D9.**
 | [0.4 Workflow engines](0.4-workflow-engines.md) | Native Cloudflare Workflows or `effect/workflow` on the Durable Object engine? | D9 | M |
 | [0.5 LLM](0.5-llm.md) | Can we run a single, checkpointable LLM step with tools inside a DO, through Workers AI and AI Gateway, and swap in a scripted model for tests? | D5, D6 | M |
 | [0.6 Verified facts](0.6-verified-facts.md) | What are the platform limits and guarantees the design relies on? | all | S |
+| [0.7 Effect's Cloudflare cluster](0.7-effect-cloudflare-cluster.md) | Should agents be `effect/cluster` entities on `@effect/platform-cloudflare`, with our waiting layer on top? (added after M8) | D2, D3, D4, D7 | M |
 
 ## Order
 

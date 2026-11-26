@@ -3,6 +3,7 @@
 import * as Context from "effect/Context";
 import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import type * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import type { TaskRecord } from "./inbox.ts";
 
@@ -71,6 +72,11 @@ export class InputConflict extends Schema.TaggedError<InputConflict>()("InputCon
   message: Schema.String,
 }) {}
 
+/** There is no task with this id (it never existed, or was pruned by the agent's retention). */
+export class TaskNotFound extends Schema.TaggedError<TaskNotFound>()("TaskNotFound", {
+  taskId: Schema.String,
+}) {}
+
 /** The task was canceled before it settled (`Agent.cancel`, or `POST …/tasks/:taskId/cancel`). */
 export class Canceled extends Schema.TaggedError<Canceled>()("Canceled", {
   reason: Schema.String,
@@ -87,6 +93,7 @@ export const AgentErrorReason = Schema.Union([
   FsDenied,
   InputConflict,
   Canceled,
+  TaskNotFound,
 ]);
 
 /**
@@ -227,19 +234,29 @@ export class ExternalTask extends Context.Service<
 >()("alchemy-agent/ExternalTask") {}
 
 /**
- * Raised (as a defect, so handler error handling doesn't swallow it) when a handler reaches an
- * unfinished turn or call: the task suspends and resumes when it settles.
+ * How an execution (a handler run, or one tool call of a turn) suspends when it reaches an
+ * unfinished turn or call, the way `effect/workflow` suspends a run: it records what it waits on,
+ * then interrupts itself. Interruption passes through `catch`, `catchTag`, `catchDefect`, `orElse`
+ * and `retry`, so handler error handling doesn't see it. The runtime checks `waitingOn` after the
+ * execution ends: once it's set, the execution is suspended whatever its exit, so code that catches
+ * the interruption (`catchCause`, `exit`) can't turn a wait into an answer; its outcome is discarded.
  */
-export class Suspend {
-  readonly _tag = "alchemy-agent/Suspend";
-  constructor(readonly turnId: string) {}
+export interface Suspension {
+  waitingOn: string | undefined;
 }
+export const makeSuspension = (): Suspension => ({ waitingOn: undefined });
+export const suspend = (suspension: Suspension, waitingOn: string): Effect.Effect<never> =>
+  Effect.suspend(() => {
+    suspension.waitingOn ??= waitingOn;
+    return Effect.interrupt;
+  });
 
 // ---------------------------------------------------------------------------
 // Retry policy
 // ---------------------------------------------------------------------------
 
-export interface RetryPolicy {
+/** The shorthand retry policy: exponential backoff with a cap and an attempt limit. */
+export interface RetryOptions {
   /** Deliveries before the task fails. Default 3. */
   readonly maxAttempts?: number;
   /** Delay before the first redelivery; doubles each time. Default 1 second. */
@@ -247,6 +264,17 @@ export interface RetryPolicy {
   /** Upper bound on the delay. Default 5 minutes. */
   readonly maxDelay?: Duration.Input;
 }
+
+/**
+ * When a failed task is delivered again: an Effect `Schedule`, as with `Effect.retry`, or the
+ * `RetryOptions` shorthand. A schedule is stepped once per failure, with the failure as its input;
+ * when it ends, the task fails with `RetriesExhausted`. The schedule is replayed from its start for
+ * each failure (retries are durable, so no schedule state survives between them), on a clock that
+ * advances by its own delays. A schedule that never ends stops after 100 attempts.
+ *
+ *   Agent.Retry: Schedule.exponential("1 second").pipe(Schedule.jittered, Schedule.upTo({ times: 5 }))
+ */
+export type RetryPolicy = RetryOptions | Schedule.Schedule<any, unknown>;
 
 /**
  * A task's own retry policy, as an Rpc annotation (like `ClusterSchema.Persisted`). It overrides
