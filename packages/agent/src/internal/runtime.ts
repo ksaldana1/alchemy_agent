@@ -40,6 +40,8 @@ import {
 import * as Inbox from "./inbox.ts";
 import { makeOutbox, type Outbox } from "./outbox.ts";
 import { makeSessions, type Limits, type OutputSpec } from "./session.ts";
+import { signalWorkflow } from "./workflow.ts";
+import { WorkflowEngine } from "effect/workflow";
 import { DeferredModel } from "../AgentModel.ts";
 
 const DEFAULT_RETRY = { maxAttempts: 3, delay: "1 second", maxDelay: "5 minutes" } as const;
@@ -188,6 +190,12 @@ export const agentObject = (config: HostConfig) => {
         schedule: (at, progress) =>
           outboxCallback!.schedule("outbox", { at: Math.max(at, now()), payload: { v: 1 }, progress }).pipe(Effect.orDie),
         wake: (owner) => (owner.kind === "task" ? resumeTask(owner.id) : sessions.resume(owner.id)),
+        // A workflow engine is in the context when the Worker provides one (and the workflows).
+        signalWorkflow: (target, deferredName, record) =>
+          Option.match(Context.getOption(context, WorkflowEngine.WorkflowEngine), {
+            onNone: () => Effect.fail(new Error(`no workflow engine is hosted with ${type}: can't reply to ${target.type}`)),
+            onSome: (engine) => signalWorkflow(engine, target, deferredName, record) as Effect.Effect<void>,
+          }),
       });
 
       /** `Agent.generate` in a handler: the i-th call of a task is turn `<taskId>#<i>`. */

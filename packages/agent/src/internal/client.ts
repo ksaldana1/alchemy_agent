@@ -25,6 +25,7 @@ import {
 } from "./core.ts";
 import type { StoredFailure, TaskRecord } from "./inbox.ts";
 import type { SessionEvent } from "./session.ts";
+import { currentRun, workflowCall } from "./workflow.ts";
 
 export interface AgentContract {
   readonly type: string;
@@ -118,6 +119,12 @@ export const makeClient = <Rpcs extends Rpc.Any>(contract: AgentContract, agent:
       const calls = yield* Effect.serviceOption(Calls);
       if (calls._tag === "Some") {
         const settled = yield* calls.value.call({ agent, tag, taskId: keyedTaskId(tag, payload), payload: encoded, wait });
+        return settled === undefined ? undefined : yield* outcome(agent, rpc, settled);
+      }
+      // Inside a workflow run, the call is a durable step: sent once, waited on without execution.
+      const run = yield* currentRun;
+      if (run !== undefined) {
+        const settled = yield* workflowCall(run, { agent, tag, taskId: keyedTaskId(tag, payload), payload: encoded, wait });
         return settled === undefined ? undefined : yield* outcome(agent, rpc, settled);
       }
       const recorded = yield* transport.enqueue(keyedTaskId(tag, payload) ?? crypto.randomUUID(), tag, encoded);

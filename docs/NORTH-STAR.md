@@ -134,8 +134,7 @@ export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   notes: Schema.String,
 }) {}
 
-export const PublishArticle = Workflow.make({
-  name: "PublishArticle",
+export const PublishArticle = Workflow.make("PublishArticle", {
   payload: { path: Schema.String, name: Schema.String },
   success: Workspace.FileRef,
   error: Rejected,

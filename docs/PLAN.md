@@ -40,7 +40,7 @@ when you do.
 | D6 | Agent loop durability | An LLM turn is a **checkpointed state machine**. Each model call and each tool call is a persisted step in the session transcript. The next step is scheduled by a durable callback. A redeploy or eviction resumes from the last checkpoint and never re-runs the whole turn. |
 | D7 | Waiting | Waiting on another agent, a person, or a timer **suspends** the session (status `waiting`) and releases the DO. The reply arrives as a new inbox item that resumes it. The transcript is the continuation, so no JS stack has to be resumed. |
 | D8 | Files | R2 holds file contents. Grants and the audit live in one `AgentWorkspace` Durable Object (changed from D1 on 2026-11-26; see M4), which checks the grant and then touches R2. |
-| D9 | Workflows | Pick in M0.4: native `Cloudflare.Workflow` vs `effect/workflow` on `layerDurableObjectEngine`. The public `AgentWorkflow` API is the same either way. |
+| D9 | Workflows | **Decided in 0.4 (2026-11-26):** `effect/workflow` (`Workflow.make`, `Activity`, `DurableDeferred`, `DurableClock`) on Alchemy's Durable Object engine (`Cloudflare.Workflows.layerDurableObjectEngine()`). Agent client calls inside a run are durable steps. The native engine runs the same code but has no durable timeouts. |
 
 ## Repo layout (Bun workspace)
 
@@ -67,7 +67,8 @@ examples/support-desk/   # LLM demo (port of mini-agent-runtime/examples/support
 
 ## M0: Foundation and spikes (stop and review after this milestone)
 
-> **Status (2026-11-25):** 0.1–0.3 and 0.5 are done (findings in `docs/spike/`). D5 and D6 are
+> **Status (2026-11-26):** 0.1–0.5 are done (findings in `docs/spike/`); 0.4 decided D9 on 2026-11-26.
+> **Earlier (2026-11-25):** 0.1–0.3 and 0.5 were done. D5 and D6 are
 > confirmed by 0.5, with caveats about Alchemy's Workers AI adapter (see 0.5's verdict). By decision on
 > 2026-11-25, M1 started without 0.4 and 0.5: 0.5 runs before M2 and 0.4 before M5, since only
 > those milestones depend on them. D1–D4 are confirmed by 0.2/0.3; D9 stays proposed until 0.4.
@@ -328,6 +329,13 @@ Changes from the design above, and why:
 - **`FileNotFound` is retryable** (a file may appear later), unlike `FsDenied`.
 
 ## M5: Workflows
+
+> From 0.4: workflows are plain `effect/workflow` code on the Durable Object engine, and an agent
+> client call inside a run is already a durable step (`internal/workflow.ts`). So most of the
+> `AgentWorkflow` wrapper below isn't needed. M5 is left with: wiring the engine (and its
+> provision to agents) into hosting, `waitFor` with a timeout over `DurableDeferred.raceAll`,
+> the API routes for runs and signals, skipping the workflow path inside an `Activity`, and the
+> newsroom's `publish`.
 
 - `AgentWorkflow.make(name, { input, run })` on the engine chosen in M0.4.
 - `AgentWorkflow.call(Agent, task, input)` enqueues with a deterministic `taskId` (instance ID + call index). The agent signals completion, the step waits and returns the typed result, or fails with `TaskFailedError`. Parallel calls go through `Effect.all`.

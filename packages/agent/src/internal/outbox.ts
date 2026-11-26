@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema";
 import { callAgent } from "./client.ts";
 import { AgentErrorReason, Calls, Suspend, Unreachable, type Address, type CallRequest } from "./core.ts";
 import * as Inbox from "./inbox.ts";
+import { WORKFLOW_PREFIX } from "./workflow.ts";
 
 /** Deliveries per pass before the callback reschedules itself. */
 const BATCH = 20;
@@ -56,6 +57,8 @@ export interface OutboxDeps {
   readonly schedule: (at: number, progress: number) => Effect.Effect<void, never, RuntimeContext>;
   /** Resumes what waited on a call (inside the transaction that recorded the answer). */
   readonly wake: (owner: { readonly kind: "task" | "turn"; readonly id: string }) => Effect.Effect<void, never, RuntimeContext>;
+  /** Delivers a reply to a waiting workflow run (`workflow:<Name>` / executionId / deferred). */
+  readonly signalWorkflow: (target: Address, deferredName: string, record: Inbox.TaskRecord) => Effect.Effect<void, unknown>;
 }
 
 const encodeReason = Schema.encodeSync(Schema.toCodecJson(AgentErrorReason as Schema.Codec<unknown, unknown, never, never>));
@@ -161,6 +164,10 @@ export const makeOutbox = (deps: OutboxDeps) => {
   const deliver = (row: Row) =>
     Effect.gen(function* () {
       const target: Address = { type: row.target_type, name: row.target_name };
+      if (row.kind === "reply" && row.target_type.startsWith(WORKFLOW_PREFIX)) {
+        yield* deps.signalWorkflow(target, row.reply_id!, JSON.parse(row.record!));
+        return undefined;
+      }
       if (row.kind === "reply") {
         yield* callAgent(target, (stub) => stub.reply(row.reply_id!, JSON.parse(row.record!)));
         return undefined;
