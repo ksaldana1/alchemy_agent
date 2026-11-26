@@ -16,11 +16,11 @@ import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as SchemaAST from "effect/SchemaAST";
 import type { Rpc } from "effect/rpc";
-import { InTask, type AgentContract, type AgentRpc } from "./client.ts";
+import type { AgentContract, AgentRpc } from "./client.ts";
 import {
   AgentContext,
-  AgentError,
   AgentErrorReason,
+  Calls,
   CurrentExecution,
   ExecutionLost,
   GenerationError,
@@ -37,6 +37,7 @@ import {
   type RetryPolicy,
 } from "./core.ts";
 import * as Inbox from "./inbox.ts";
+import { makeOutbox, type Outbox } from "./outbox.ts";
 import { makeSessions, type Limits, type OutputSpec } from "./session.ts";
 import { DeferredModel } from "../AgentModel.ts";
 
@@ -45,6 +46,7 @@ const DEFAULT_RETRY = { maxAttempts: 3, delay: "1 second", maxDelay: "5 minutes"
 const DRAIN_BATCH = 10;
 const DRAIN_CALLBACK = "alchemy-agent/drain";
 const STEP_CALLBACK = "alchemy-agent/step";
+const OUTBOX_CALLBACK = "alchemy-agent/outbox";
 
 export type Handler = (request: {
   readonly payload: unknown;
@@ -57,6 +59,8 @@ type Outcome =
   | { readonly _tag: "Completed"; readonly result: unknown }
   | { readonly _tag: "Suspended" }
   | { readonly _tag: "Failed"; readonly permanent: boolean; readonly error: Inbox.StoredFailure };
+/** An execution's outcome, and the calls it made (recorded only if it completed or suspended). */
+type Executed = { readonly outcome: Outcome; readonly flush: Effect.Effect<void, never, RuntimeContext> };
 
 const json = (schema: Schema.Top) => Schema.toCodecJson(schema as Schema.Codec<unknown, unknown, never, never>);
 const encodeReason = Schema.encodeSync(json(AgentErrorReason));
@@ -146,6 +150,10 @@ export const agentObject = (config: HostConfig) => {
           .pipe(Effect.orDie);
 
       let stepCallback: Alchemy.Callback<{ readonly v: 1; readonly turnId: string }> | undefined;
+      let outboxCallback: Alchemy.Callback<{ readonly v: 1 }> | undefined;
+      // Created below; `callsFor` and `wake` only run once the object is up.
+      let outbox: Outbox;
+      const causationOf = (taskId: string) => `${type}/${agent.name}/${taskId}`;
       const sessions = makeSessions({
         sql,
         transaction,
@@ -161,11 +169,24 @@ export const agentObject = (config: HostConfig) => {
           ),
         scheduleStep: (turnId, afterMs, progress) =>
           stepCallback!.schedule(turnId, { after: `${afterMs} millis`, payload: { v: 1, turnId }, progress }).pipe(Effect.orDie),
-        onSettled: (taskId) =>
-          Effect.gen(function* () {
-            // With `progress`, the drain doesn't inherit the step job's attempt count (and backoff).
-            if (yield* Inbox.resume(sql, taskId, now())) yield* scheduleDrain(now(), yield* Inbox.advanceCursor(sql));
-          }),
+        onSettled: (taskId) => resumeTask(taskId),
+        callsFor: (turn, toolCallId) =>
+          outbox.calls({ kind: "turn", id: turn.id, prefix: `${turn.id}/${toolCallId}`, causation: causationOf(turn.task_id) }),
+      });
+      // With `progress`, the drain doesn't inherit the scheduling job's attempt count (and backoff).
+      function resumeTask(taskId: string) {
+        return Effect.gen(function* () {
+          if (yield* Inbox.resume(sql, taskId, now())) yield* scheduleDrain(now(), yield* Inbox.advanceCursor(sql));
+        });
+      }
+      outbox = makeOutbox({
+        sql,
+        transaction,
+        now,
+        self: agent,
+        schedule: (at, progress) =>
+          outboxCallback!.schedule("outbox", { at: Math.max(at, now()), payload: { v: 1 }, progress }).pipe(Effect.orDie),
+        wake: (owner) => (owner.kind === "task" ? resumeTask(owner.id) : sessions.resume(owner.id)),
       });
 
       /** `Agent.generate` in a handler: the i-th call of a task is turn `<taskId>#<i>`. */
@@ -204,7 +225,12 @@ export const agentObject = (config: HostConfig) => {
         });
       };
 
-      const execute = Effect.fnUntraced(function* (row: Inbox.InboxRow, attempt: number) {
+      const execute = (row: Inbox.InboxRow, attempt: number): Effect.Effect<Executed, never, RuntimeContext> => {
+        const calls = outbox.calls({ kind: "task", id: row.task_id, prefix: row.task_id, causation: causationOf(row.task_id) });
+        return Effect.map(run(row, attempt, calls.service), (outcome) => ({ outcome, flush: calls.flush }));
+      };
+
+      const run = Effect.fnUntraced(function* (row: Inbox.InboxRow, attempt: number, calls: Context.Service.Shape<typeof Calls>) {
         const rpc: Rpc.AnyWithProps | undefined = contract.rpcs.get(row.task);
         const handler = handlers[row.task];
         if (rpc === undefined || handler === undefined) {
@@ -218,7 +244,8 @@ export const agentObject = (config: HostConfig) => {
         if (hasModel) services = Context.add(services, Generating, generating(row));
         const exit = yield* handler({ payload: payload.success, taskId: row.task_id, attempt, agent }).pipe(
           Effect.provideContext(services as Context.Context<unknown>),
-          Effect.provideService(InTask, true),
+          // Agent calls go through the outbox; a waiting one suspends the task.
+          Effect.provideService(Calls, calls),
           Effect.provideService(CurrentExecution, execution),
           Effect.annotateLogs({ agent: `${type}/${agent.name}`, taskId: row.task_id, attempt }),
           Effect.exit,
@@ -234,10 +261,6 @@ export const agentObject = (config: HostConfig) => {
           if (Schema.is(rpc.errorSchema as Schema.Top)(e)) {
             const value = yield* Schema.encodeUnknownEffect(json(rpc.errorSchema))(e).pipe(Effect.orDie);
             return { _tag: "Failed", permanent: true, error: { kind: "declared", value } } as Outcome;
-          }
-          // Waiting inside a handler is a programming error (until M3): retrying can't help.
-          if ((e as object) instanceof AgentError && (e as AgentError).reason._tag === "WaitingInHandler") {
-            return { _tag: "Failed", permanent: true, error: agentFailure((e as AgentError).reason) } as Outcome;
           }
           // A failed LLM turn fails the same way on every rerun, so it settles the task.
           if ((e as object) instanceof GenerationError) {
@@ -278,9 +301,12 @@ export const agentObject = (config: HostConfig) => {
         // pass belongs to an execution that ended without settling it: a lost attempt.
         for (const row of yield* Inbox.running(sql)) {
           yield* transaction(
-            row.attempts >= row.max_attempts
-              ? Inbox.fail(sql, row.seq, agentFailure(new ExecutionLost({ attempts: row.attempts })), now())
-              : Inbox.retryLater(sql, row.seq, { kind: "attempt", message: "the execution running this task ended" }, now() + backoff(row.task, row.attempts)),
+            Effect.andThen(
+              row.attempts >= row.max_attempts
+                ? Inbox.fail(sql, row.seq, agentFailure(new ExecutionLost({ attempts: row.attempts })), now())
+                : Inbox.retryLater(sql, row.seq, { kind: "attempt", message: "the execution running this task ended" }, now() + backoff(row.task, row.attempts)),
+              outbox.notify(row.task_id),
+            ),
           );
           yield* release(row.task_id);
         }
@@ -291,14 +317,25 @@ export const agentObject = (config: HostConfig) => {
           const attempt = row.attempts + 1;
           // Persist `running` before the handler runs, so a crash counts as an attempt.
           yield* transaction(Inbox.markRunning(sql, row.seq, now()));
-          const result = yield* execute(row, attempt);
+          const { outcome: result, flush } = yield* execute(row, attempt);
+          // The outcome, the calls the handler made (unless it failed), and the replies owed to
+          // whoever waits for this task commit together.
           yield* transaction(
-            result._tag === "Completed"
-              ? Inbox.complete(sql, row.seq, result.result, now())
-              : result._tag === "Suspended"
-                ? Inbox.suspend(sql, row.seq)
-                : afterFailure(row, attempt, result.error, result.permanent),
+            Effect.gen(function* () {
+              if (result._tag === "Completed") yield* Effect.andThen(Inbox.complete(sql, row.seq, result.result, now()), flush);
+              else if (result._tag === "Suspended") yield* Effect.andThen(Inbox.suspend(sql, row.seq), flush);
+              else yield* afterFailure(row, attempt, result.error, result.permanent);
+              yield* outbox.notify(row.task_id);
+            }),
           );
+          if (result._tag !== "Suspended") {
+            const settled = yield* Inbox.get(sql, row.task_id);
+            if (settled !== undefined && Inbox.isSettled(settled)) {
+              yield* Effect.logInfo("task.settled").pipe(
+                Effect.annotateLogs({ agent: `${type}/${agent.name}`, taskId: row.task_id, status: settled.status, causation: settled.causation }),
+              );
+            }
+          }
           yield* release(row.task_id);
           processed++;
         }
@@ -314,6 +351,10 @@ export const agentObject = (config: HostConfig) => {
         (p: { readonly v: 1; readonly turnId: string }) => sessions.step(p.turnId),
         { retry: { delay: "1 second" } },
       );
+      // M3: delivers this agent's outbox (calls it makes, replies it owes).
+      outboxCallback = yield* Alchemy.makeCallback(OUTBOX_CALLBACK, (_: { readonly v: 1 }) => outbox.deliveryPass, {
+        retry: { delay: "1 second" },
+      });
 
       const record = (taskId: string) =>
         Inbox.get(sql, taskId).pipe(Effect.map((row) => (row === undefined ? null : Inbox.toRecord(row))));
@@ -365,6 +406,8 @@ export const agentObject = (config: HostConfig) => {
             ),
           ),
         events: (sessionId, after) => sessions.events(sessionId, after),
+        subscribe: (taskId, replyTo) => outbox.subscribe(taskId, replyTo),
+        reply: (id, record) => outbox.reply(id, record),
       };
       return rpc;
     });

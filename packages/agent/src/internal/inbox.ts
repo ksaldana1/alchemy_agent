@@ -19,7 +19,10 @@ export interface Sql {
   >;
 }
 
-/** `waiting`: suspended on a prompt's turn (M2); it resumes as `pending` when the turn settles. */
+/**
+ * `waiting`: suspended on an LLM turn or on another agent's answer; it resumes as `pending` when
+ * that settles.
+ */
 export type TaskStatus = TaskRecord["status"];
 
 /**
@@ -127,6 +130,35 @@ const MIGRATIONS: ReadonlyArray<string> = [
    CREATE TABLE alchemy_agent_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);`,
   // API reset: a turn's system prompt (per `Agent.generate` call).
   `ALTER TABLE alchemy_agent_turns ADD COLUMN system TEXT;`,
+  // M3: messages between agents. `outbox` holds calls this agent makes and replies it owes;
+  // `subscribers` holds who waits for which of this agent's tasks.
+  `CREATE TABLE alchemy_agent_outbox (
+     id          TEXT    PRIMARY KEY,
+     kind        TEXT    NOT NULL,
+     owner_kind  TEXT,
+     owner_id    TEXT,
+     target_type TEXT    NOT NULL,
+     target_name TEXT    NOT NULL,
+     task_id     TEXT    NOT NULL,
+     tag         TEXT,
+     payload     TEXT,
+     reply_id    TEXT,
+     wait        INTEGER NOT NULL DEFAULT 0,
+     causation   TEXT,
+     status      TEXT    NOT NULL,
+     record      TEXT,
+     attempts    INTEGER NOT NULL DEFAULT 0,
+     run_at      INTEGER NOT NULL,
+     created_at  INTEGER NOT NULL
+   );
+   CREATE INDEX alchemy_agent_outbox_due ON alchemy_agent_outbox (status, run_at);
+   CREATE TABLE alchemy_agent_subscribers (
+     task_id    TEXT NOT NULL,
+     reply_type TEXT NOT NULL,
+     reply_name TEXT NOT NULL,
+     reply_id   TEXT NOT NULL,
+     PRIMARY KEY (task_id, reply_type, reply_name, reply_id)
+   );`,
 ];
 
 export const migrate = Effect.fnUntraced(function* (
@@ -294,7 +326,7 @@ export const retryLater = (sql: Sql, seq: number, error: StoredFailure, runAt: n
  * `progress` when it reschedules itself (without it, Alchemy treats each reschedule as a
  * retry and backs off; see docs/spike/0.3-durable-callbacks.md E9).
  */
-export const advanceCursor = (sql: Sql, key: "drain_cursor" | "step_cursor" = "drain_cursor") =>
+export const advanceCursor = (sql: Sql, key: "drain_cursor" | "step_cursor" | "outbox_cursor" = "drain_cursor") =>
   Effect.flatMap(
     sql.exec<{ value: number }>(
       "INSERT INTO alchemy_agent_meta (key, value) VALUES (?, 1) ON CONFLICT (key) DO UPDATE SET value = value + 1 RETURNING value",
@@ -303,7 +335,7 @@ export const advanceCursor = (sql: Sql, key: "drain_cursor" | "step_cursor" = "d
     (c) => c.one(),
   ).pipe(Effect.map((r) => r.value));
 
-/** The handler reached an unfinished turn: the task waits. The suspended run isn't an attempt. */
+/** The handler reached an unfinished turn or call: the task waits. The suspended run isn't an attempt. */
 export const suspend = (sql: Sql, seq: number) =>
   sql
     .exec(
@@ -312,7 +344,7 @@ export const suspend = (sql: Sql, seq: number) =>
     )
     .pipe(Effect.asVoid);
 
-/** A waiting task's turn settled: deliver it again, now. Returns whether it was waiting. */
+/** What a waiting task waited for settled: deliver it again, now. Returns whether it was waiting. */
 export const resume = (sql: Sql, taskId: string, now: number) =>
   Effect.flatMap(
     sql.exec<{ seq: number }>(
@@ -332,3 +364,5 @@ export const count = (sql: Sql, name: string) =>
     ),
     (c) => c.one(),
   ).pipe(Effect.map((r) => r.value));
+
+export const isSettled = (row: Row) => row.status === "completed" || row.status === "failed";

@@ -58,11 +58,24 @@ const CheckWarehouse = Tool.make("check_warehouse", {
   parameters: Schema.Struct({ product: Schema.String }),
   success: Schema.Struct({ product: Schema.String, inStock: Schema.Number }),
 });
-const Tools = Toolkit.make(LookupOrder, CheckWarehouse);
+/** Delegates to the Triage agent (an LLM agent itself) and waits for its answer (M3). */
+const TriageTool = Tool.make("triage_ticket", {
+  description: "File the customer's problem as a support ticket. Returns its category and urgency.",
+  parameters: Schema.Struct({ ticket: Schema.String }),
+  success: TriageResult,
+  dependencies: [Agent.ToolCall],
+});
+const Tools = Toolkit.make(LookupOrder, CheckWarehouse, TriageTool);
 const ToolsLive = Tools.toLayer(
   Tools.of({
     lookup_order: ({ orderId }) => Effect.succeed({ orderId, status: "shipped", items: ["blue mug", "tea sampler"] }),
     check_warehouse: ({ product }) => Effect.sleep("15 seconds").pipe(Effect.as({ product, inStock: 42 })),
+    // The turn waits (holding no execution) until Triage answers, then this tool returns it.
+    triage_ticket: Effect.fn("Helpdesk.triage_ticket")(function* ({ ticket }) {
+      const call = yield* Agent.ToolCall;
+      const triage = yield* Triage.client;
+      return yield* triage("front").TriageTicket({ name: `chat:${call.idempotencyKey}`, ticket }).pipe(Effect.orDie);
+    }),
   }),
 );
 
@@ -70,7 +83,9 @@ export const HelpdeskLive = Helpdesk.toLayer(
   Helpdesk.of({
     Chat: ({ payload }) =>
       Agent.generate({
-        system: "You are a support agent. Use the tools to answer questions about orders and stock. Be brief.",
+        system:
+          "You are a support agent. Use the tools to answer questions about orders and stock. When a customer reports " +
+          "a problem, file it with triage_ticket and tell them its category and urgency. Be brief.",
         prompt: payload.message,
         session: payload.session,
       }),

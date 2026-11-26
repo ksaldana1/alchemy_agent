@@ -17,9 +17,9 @@ import {
   AgentError,
   AgentErrorReason,
   bindingTransportRef,
+  Calls,
   RetriesExhausted,
   Unreachable,
-  WaitingInHandler,
   type Address,
   type Transport,
 } from "./core.ts";
@@ -47,16 +47,11 @@ export type AgentClient<Rpcs extends Rpc.Any> = {
   };
 };
 
-/** Set while a task handler runs: waiting for another agent there isn't possible until M3. */
-export const InTask = Context.Reference<boolean>("alchemy-agent/InTask", {
-  defaultValue: () => false,
-});
-
 const json = (schema: Schema.Top) => Schema.toCodecJson(schema as Schema.Codec<unknown, unknown, never, never>);
 
-/** The task id for a payload: from the Rpc's `primaryKey` if it has one, else random. */
-const taskIdFor = (tag: string, payload: unknown) =>
-  PrimaryKey.isPrimaryKey(payload) ? `${tag}:${PrimaryKey.value(payload)}` : crypto.randomUUID();
+/** The task id a payload's `primaryKey` gives, if it has one. */
+const keyedTaskId = (tag: string, payload: unknown) =>
+  PrimaryKey.isPrimaryKey(payload) ? `${tag}:${PrimaryKey.value(payload)}` : undefined;
 
 const isSettled = (r: TaskRecord) => r.status === "completed" || r.status === "failed";
 
@@ -118,16 +113,15 @@ export const makeClient = <Rpcs extends Rpc.Any>(contract: AgentContract, agent:
             }),
         ),
       );
-      const recorded = yield* transport.enqueue(taskIdFor(tag, payload), tag, encoded);
-      if (options?.discard) return undefined;
-      if (yield* InTask) {
-        return yield* new AgentError({
-          agent,
-          reason: new WaitingInHandler({
-            message: `waiting for ${agent.type}/${agent.name}.${tag} inside a handler isn't supported until M3; pass { discard: true }`,
-          }),
-        });
+      const wait = options?.discard !== true;
+      // Inside an agent, the call goes through its outbox (recorded with the execution's outcome).
+      const calls = yield* Effect.serviceOption(Calls);
+      if (calls._tag === "Some") {
+        const settled = yield* calls.value.call({ agent, tag, taskId: keyedTaskId(tag, payload), payload: encoded, wait });
+        return settled === undefined ? undefined : yield* outcome(agent, rpc, settled);
       }
+      const recorded = yield* transport.enqueue(keyedTaskId(tag, payload) ?? crypto.randomUUID(), tag, encoded);
+      if (!wait) return undefined;
       return yield* outcome(agent, rpc, yield* awaitSettled(transport, agent, recorded.taskId));
     });
   }
@@ -154,6 +148,13 @@ export type AgentRpc = {
   wait: (taskId: string, timeoutMs: number) => Effect.Effect<TaskRecord | null, never, any>;
   transcript: (sessionId: string, after: number) => Effect.Effect<ReadonlyArray<TranscriptEntry>, never, any>;
   events: (sessionId: string, after: number) => Stream.Stream<SessionEvent, never, any>;
+  /**
+   * M3: `replyTo` (an agent and its outbox row) is told when the task settles. Returns the
+   * current record (already settled: no reply follows), or null for an unknown task.
+   */
+  subscribe: (taskId: string, replyTo: { readonly type: string; readonly name: string; readonly id: string }) => Effect.Effect<TaskRecord | null, never, any>;
+  /** M3: the answer to a call this agent waits for (its outbox row `id`). Idempotent. */
+  reply: (id: string, record: TaskRecord) => Effect.Effect<void, never, any>;
 };
 
 export interface TranscriptEntry {
@@ -186,7 +187,7 @@ export const stubFor = (address: Address) =>
  * A failed RPC (e.g. the Durable Object reset mid-call) becomes an AgentError after a few
  * retries. Every operation is idempotent, so retrying is safe.
  */
-const reliably = <A>(address: Address, call: (stub: AgentRpc) => Effect.Effect<A, never, any>) =>
+export const callAgent = <A>(address: Address, call: (stub: AgentRpc) => Effect.Effect<A, never, any>) =>
   Effect.flatMap(stubFor(address), (stub) => call(stub) as unknown as Effect.Effect<A, unknown>).pipe(
     Effect.catchCause((cause) =>
       Cause.hasInterruptsOnly(cause)
@@ -202,8 +203,10 @@ const reliably = <A>(address: Address, call: (stub: AgentRpc) => Effect.Effect<A
                 }),
           ),
     ),
-    Effect.retry({ schedule: Schedule.exponential("200 millis"), times: 6 }),
   );
+
+const reliably = <A>(address: Address, call: (stub: AgentRpc) => Effect.Effect<A, never, any>) =>
+  callAgent(address, call).pipe(Effect.retry({ schedule: Schedule.exponential("200 millis"), times: 6 }));
 
 export const bindingTransport = (address: Address): Transport => {
   // The current task, if any, is the new task's causation.

@@ -7,6 +7,7 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Test from "@alchemy.run/test/Bun";
 import { expect } from "bun:test";
 import * as Effect from "effect/Effect";
+import * as Schedule from "effect/Schedule";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
@@ -42,6 +43,16 @@ const record = (type: string, name: string, taskId: string) =>
   );
 
 const timeout = { timeout: 60_000 };
+
+/** A task's record once it has settled (it may not exist yet: sends are delivered asynchronously). */
+const settledRecord = (type: string, name: string, taskId: string) =>
+  record(type, name, taskId).pipe(
+    Effect.repeat({
+      schedule: Schedule.spaced("250 millis"),
+      until: (r) => r.status === "completed" || r.status === "failed",
+      times: 120,
+    }),
+  );
 
 test(
   "happy path: a call records the task, runs it, and returns its output",
@@ -214,10 +225,9 @@ test(
     Effect.gen(function* () {
       const { taskId } = yield* (yield* Relay.client)(`r-${run}`).Forward({ text: "via" });
       expect(taskId).toStartWith("EchoKeyed:");
-      // The Echo agent got the task; wait for it through its keyed id.
-      const echoed = yield* (yield* Echo.client)(`from-r-${run}`).EchoKeyed({ id: taskId.slice("EchoKeyed:".length), text: "ignored" });
-      expect(echoed).toEqual({ echoed: "VIA" });
-      const rec = yield* record("Echo", `from-r-${run}`, taskId);
+      // The send was recorded with Forward's outcome and delivered after it, by the outbox.
+      const rec = yield* settledRecord("Echo", `from-r-${run}`, taskId);
+      expect(rec).toMatchObject({ status: "completed", result: { echoed: "VIA" } });
       expect(rec.causation).toStartWith(`Relay/r-${run}/`);
     }),
   ),
@@ -225,11 +235,74 @@ test(
 );
 
 test(
-  "waiting for another agent inside a handler fails clearly (until M3)",
+  "a handler waits for another agent's answer without holding an execution",
   viaApi(
     Effect.gen(function* () {
-      const error = yield* Effect.flip((yield* Relay.client)(`ask-${run}`).AskEcho({ text: "x" }));
-      expect(error.reason).toMatchObject({ _tag: "WaitingInHandler" });
+      expect(yield* (yield* Relay.client)(`ask-${run}`).AskEcho({ text: "x" })).toBe("X");
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "A → B → A: agents waiting on each other don't deadlock",
+  viaApi(
+    Effect.gen(function* () {
+      const path = yield* (yield* Relay.client)(`v-${run}-a`).Volley({ n: 4, path: [] });
+      expect(path).toEqual([`v-${run}-a`, `v-${run}-b`, `v-${run}-a`, `v-${run}-b`, `v-${run}-a`]);
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "a declared error reaches the waiting handler as itself",
+  viaApi(
+    Effect.gen(function* () {
+      expect(yield* (yield* Relay.client)(`refuse-${run}`).AskRefuse()).toBe("caught: never");
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "parallel calls are all sent, once each, with ids derived from the calling task",
+  viaApi(
+    Effect.gen(function* () {
+      const out = yield* (yield* Relay.client)(`fan-${run}`).FanOut({ key: "k", texts: ["a", "b", "c"] });
+      expect(out).toEqual(["A", "B", "C"]);
+      for (const i of [0, 1, 2]) {
+        const rec = yield* record("Echo", `fan-${i}`, `Relay/fan-${run}/FanOut:k#c${i}`);
+        expect(rec).toMatchObject({ status: "completed", attempts: 1, causation: `Relay/fan-${run}/FanOut:k` });
+      }
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "waiting on a keyed task that already settled answers at once, with the original result",
+  viaApi(
+    Effect.gen(function* () {
+      const id = `k-${run}`;
+      expect(yield* (yield* Echo.client)("keyed").EchoKeyed({ id, text: "first" })).toEqual({ echoed: "FIRST" });
+      // Same key, same task: the handler gets the settled result, not a new one.
+      expect(yield* (yield* Relay.client)(`keyed-${run}`).AskKeyed({ id, text: "second" })).toBe("FIRST");
+    }),
+  ),
+  timeout,
+);
+
+test(
+  "a handler that crashes after its answer arrived reruns with the recorded answer, without calling again",
+  viaApi(
+    Effect.gen(function* () {
+      const out = yield* (yield* Relay.client)(`crash-${run}`).CrashAfterAnswer({ key: "k", text: "once" });
+      expect(out).toEqual({ echoed: "ONCE", runs: 2 });
+      const call = yield* record("Echo", "crash", `Relay/crash-${run}/CrashAfterAnswer:k#c0`);
+      expect(call).toMatchObject({ status: "completed", attempts: 1 });
+      const relay = yield* record("Relay", `crash-${run}`, "CrashAfterAnswer:k");
+      expect(relay).toMatchObject({ status: "completed", attempts: 2 });
     }),
   ),
   timeout,

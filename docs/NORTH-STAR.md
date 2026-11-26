@@ -284,12 +284,13 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-As of 2026-11-26 the API reset is done, and the library has the shape above for what M1 and M2
-cover:
+As of 2026-11-26 the API reset and M3 are done, and the library has the shape above for what M1
+to M3 cover:
 
 - `Rpc` contracts and `Agent.make(type, [rpcs])`
 - `X.of` and `X.toLayer(impl, { retry, toolkit, limits })`
-- `X.client` and `{ discard: true }`
+- `X.client` and `{ discard: true }`, including waiting for another agent inside a handler or a
+  tool (the task or turn waits without an execution)
 - declared errors, `primaryKey`, and the per-task `Agent.Retry` annotation
 - `Agent.generate` with a schema, the model as a Layer, and the toolkit's handlers as a Layer
 - `Schema.TaggedError` throughout, with `AgentError` carrying a tagged reason
@@ -298,8 +299,7 @@ The Hello and support desk examples are written this way.
 
 Not yet:
 
-- **Waiting inside a handler (M3).** A handler can only send with `{ discard: true }`. Waiting
-  fails with `AgentError` (reason `WaitingInHandler`).
+- **Wait timeouts and a per-agent allowlist** of who may call whom (left out of M3).
 - **The rest:** the workspace (M4), workflows (M5), listeners (M6), human requests (M7), and
   `Platform.make`.
 - **`HttpApi`.** The HTTP API is still routed by hand and doesn't use it.

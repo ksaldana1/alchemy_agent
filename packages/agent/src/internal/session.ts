@@ -16,7 +16,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as SchemaRepresentation from "effect/SchemaRepresentation";
 import * as Stream from "effect/Stream";
-import { AgentContext, CurrentExecution, GenerationError, ModelError, StepLimit, TokenBudget, ToolCall } from "./core.ts";
+import { AgentContext, Calls, CurrentExecution, GenerationError, ModelError, StepLimit, Suspend, TokenBudget, ToolCall } from "./core.ts";
 import { advanceCursor, type Sql } from "./inbox.ts";
 
 export interface Limits {
@@ -37,7 +37,8 @@ type TurnRow = {
   id: string;
   session_id: string;
   task_id: string;
-  status: "queued" | "running" | "completed" | "failed";
+  /** `waiting`: a tool call is waiting for another agent's answer (M3). */
+  status: "queued" | "running" | "waiting" | "completed" | "failed";
   message: string;
   system: string | null;
   output_schema: string | null;
@@ -93,6 +94,14 @@ export interface SessionDeps {
   readonly scheduleStep: (turnId: string, afterMs: number, progress: number) => Effect.Effect<void, never, RuntimeContext>;
   /** Called in the transaction that settles a turn: resume the task waiting on it. */
   readonly onSettled: (taskId: string) => Effect.Effect<void, never, RuntimeContext>;
+  /**
+   * The `Calls` service for one tool call, and `flush`, run in the transaction that records the
+   * tool's result (or the turn's suspension).
+   */
+  readonly callsFor: (
+    turn: { readonly id: string; readonly task_id: string },
+    toolCallId: string,
+  ) => { readonly service: Context.Service.Shape<typeof Calls>; readonly flush: Effect.Effect<void, never, RuntimeContext> };
 }
 
 export const makeSessions = (deps: SessionDeps) => {
@@ -160,7 +169,7 @@ export const makeSessions = (deps: SessionDeps) => {
 
   /** Starts the oldest queued turn of a session, unless one is already running. */
   const startNext = Effect.fnUntraced(function* (sessionId: string) {
-    const running = yield* all<{ id: string }>("SELECT id FROM alchemy_agent_turns WHERE session_id = ? AND status = 'running' LIMIT 1", sessionId);
+    const running = yield* all<{ id: string }>("SELECT id FROM alchemy_agent_turns WHERE session_id = ? AND status IN ('running', 'waiting') LIMIT 1", sessionId);
     if (running.length > 0) return [] as Array<SessionEvent>;
     const [turn] = yield* all<TurnRow>(
       "SELECT * FROM alchemy_agent_turns WHERE session_id = ? AND status = 'queued' ORDER BY created_at, id LIMIT 1",
@@ -236,9 +245,11 @@ export const makeSessions = (deps: SessionDeps) => {
     kind: "model" | "tool_result" | "user",
     message: Prompt.Message,
     usage?: { readonly in: number; readonly out: number },
+    alongside: Effect.Effect<void, never, RuntimeContext> = Effect.void,
   ) {
     const event = yield* transaction(
       Effect.gen(function* () {
+        yield* alongside;
         const e = yield* append(turn, kind, message);
         yield* sql.exec(
           "UPDATE alchemy_agent_turns SET steps = steps + 1, errors = 0, tokens_in = tokens_in + ?, tokens_out = tokens_out + ? WHERE id = ?",
@@ -259,7 +270,11 @@ export const makeSessions = (deps: SessionDeps) => {
   // ---- One step --------------------------------------------------------------------------
 
   /** Runs one tool call with the toolkit's handlers. Invalid arguments and failures go back to the model. */
-  const runTool = Effect.fnUntraced(function* (turn: TurnRow, call: Prompt.ToolCallPart) {
+  const runTool = Effect.fnUntraced(function* (
+    turn: TurnRow,
+    call: Prompt.ToolCallPart,
+    calls: ReturnType<SessionDeps["callsFor"]>,
+  ): Effect.fn.Return<{ readonly isFailure: boolean; readonly result: unknown } | "suspended", never, RuntimeContext> {
     const fail = (message: string) => ({ isFailure: true, result: { error: message } as unknown });
     if (deps.toolkit === undefined || !userTools.some((t) => t.name === call.name)) return fail(`Unknown tool "${call.name}"`);
     const services = Context.add(yield* deps.taskServices(turn.task_id), ToolCall, {
@@ -277,8 +292,12 @@ export const makeSessions = (deps: SessionDeps) => {
       // Tools that declare `dependencies: [AgentContext, ToolCall]` get them here.
       Effect.provideContext(Context.merge(deps.context, services) as Context.Context<never>),
       Effect.provideService(CurrentExecution, deps.execution),
+      // Agent calls in a tool go through the outbox; a waiting one suspends the turn.
+      Effect.provideService(Calls, calls.service),
       Effect.catch((e) => Effect.succeed(fail(AiError.isAiError(e) ? e.message : String((e as { message?: unknown })?.message ?? e)))),
-      Effect.catchDefect((d) => Effect.succeed(fail(d instanceof Error ? d.message : String(d)))),
+      Effect.catchDefect((d) =>
+        Effect.succeed(d instanceof Suspend ? ("suspended" as const) : fail(d instanceof Error ? d.message : String(d))),
+      ),
     );
   });
 
@@ -341,8 +360,20 @@ export const makeSessions = (deps: SessionDeps) => {
     const pending = calls.filter((c) => !answered.has(c.id) && c.name !== RESPOND);
     if (pending.length > 0) {
       const call = pending[0]!;
-      const result = yield* runTool(turn, call);
-      return yield* persistStep(turn, "tool_result", toolResult(call, result.isFailure, result.result));
+      const calls = deps.callsFor(turn, call.id);
+      const result = yield* runTool(turn, call, calls);
+      if (result === "suspended") {
+        // The tool waits for another agent: the turn holds no execution until the answer
+        // arrives, then this step runs again and the tool gets the recorded answer.
+        yield* transaction(
+          Effect.gen(function* () {
+            yield* calls.flush;
+            yield* sql.exec("UPDATE alchemy_agent_turns SET status = 'waiting' WHERE id = ? AND status = 'running'", turn.id);
+          }),
+        );
+        return yield* emit(turn.session_id, { type: "turn", turnId: turn.id, status: "waiting" });
+      }
+      return yield* persistStep(turn, "tool_result", toolResult(call, result.isFailure, result.result), undefined, calls.flush);
     }
 
     // A text answer with no tool calls ends a text turn, if it validates.
@@ -424,12 +455,18 @@ export const makeSessions = (deps: SessionDeps) => {
           offer({ type: "message", seq: r.seq, turnId: r.turn_id, kind: r.kind, message: JSON.parse(r.message) });
         }
         const active = yield* all<{ n: number }>(
-          "SELECT count(*) AS n FROM alchemy_agent_turns WHERE session_id = ? AND status IN ('queued', 'running')",
+          "SELECT count(*) AS n FROM alchemy_agent_turns WHERE session_id = ? AND status IN ('queued', 'running', 'waiting')",
           sessionId,
         );
         if ((active[0]?.n ?? 0) === 0) offer({ type: "idle" });
       }),
     );
 
-  return { createTurn, step, outcome, messages, events, emit };
+  /** In the transaction that records an answer a turn waited for: run its next step. */
+  const resume = Effect.fnUntraced(function* (turnId: string) {
+    const [turn] = yield* all<TurnRow>("UPDATE alchemy_agent_turns SET status = 'running' WHERE id = ? AND status = 'waiting' RETURNING *", turnId);
+    if (turn !== undefined) yield* schedule(turn);
+  });
+
+  return { createTurn, step, outcome, messages, events, emit, resume };
 };

@@ -9,6 +9,7 @@ import { Rpc } from "effect/rpc";
 import * as Agent from "../../src/Agent.ts";
 import * as AgentModel from "../../src/AgentModel.ts";
 import * as Testing from "../../src/Testing.ts";
+import { Echo } from "./agents.ts";
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -48,7 +49,13 @@ const Crashy = Tool.make("crashy", {
   // Tools can depend on framework services; the framework provides them per call.
   dependencies: [Agent.ToolCall],
 });
-export const Tools = Toolkit.make(LookupOrder, Crashy);
+/** Delegates to another agent and waits for its answer: the turn waits without an execution. */
+const AskEcho = Tool.make("ask_echo", {
+  description: "Ask the Echo agent to echo some text.",
+  parameters: Schema.Struct({ text: Schema.String }),
+  success: Schema.Struct({ echoed: Schema.String }),
+});
+export const Tools = Toolkit.make(LookupOrder, Crashy, AskEcho);
 
 export const ToolsLive = Tools.toLayer(
   Tools.of({
@@ -60,6 +67,8 @@ export const ToolsLive = Tools.toLayer(
         if (runs === 1) return yield* Testing.crashExecution;
         return { runs };
       }),
+    ask_echo: ({ text }) =>
+      Effect.flatMap(Echo.client, (echoes) => echoes("tool").EchoText({ text })).pipe(Effect.orDie),
   }),
 );
 
@@ -89,6 +98,7 @@ const script = (prompt: Prompt.Prompt): AgentModel.ScriptedResponse => {
         ? AgentModel.toolCall("crashy", {})
         : AgentModel.text("done after chaos");
   }
+  if (text.includes("delegate")) return n === 0 ? AgentModel.toolCall("ask_echo", { text: "psst" }) : AgentModel.text(all.includes("PSST") ? "Echo answered PSST" : "no answer");
   if (text.includes("bad args")) return n === 0 ? AgentModel.toolCall("lookup_order", { orderId: 42 }) : AgentModel.text(all.includes("Expected string") ? "fixed after error" : "no error seen");
   if (text.includes("sloppy")) return n === 0 ? AgentModel.respond({ approved: "yes", notes: "x" }) : AgentModel.respond({ approved: true, notes: all.includes("Invalid answer") ? "repaired" : "?" });
   if (text.includes("talkative")) return n === 0 ? AgentModel.text("I think it is fine.") : AgentModel.respond({ approved: false, notes: "forced" });

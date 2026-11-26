@@ -118,8 +118,9 @@ tools have to be known whenever the Durable Object wakes.
 **Errors.** A handler's declared errors (the Rpc's `error` schema) settle the task permanently and
 reach the caller as themselves, so `catchTag` works across agents. Everything else the platform
 reports is one `AgentError { agent, reason }`, where the reason is a tagged union: `Unreachable`,
-`ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`,
-`WaitingInHandler`. An undeclared failure is retried up to the attempt cap.
+`ExecutionLost`, `RetriesExhausted`, `InvalidPayload`, `UnknownTask`, `GenerationFailed`. (Records
+from before M3 can also carry `WaitingInHandler`, which nothing produces any more.) An undeclared
+failure is retried up to the attempt cap.
 
 ## The inbox (implemented in M1)
 
@@ -150,7 +151,7 @@ The drain never fails because of agent code. Handler failures are recorded in th
 inbox, not Alchemy, decides about retries, and every task settles. Alchemy retries the drain
 callback itself only when the execution dies (for example, the CPU limit), and step 1 recovers.
 
-**Callers.** `(yield* Greeter.client)("a").Greet(payload)` sends and waits for the answer;
+**Callers.** `(yield* Greeter.client)("a").Greet(payload)` sends and waits for the result;
 `{ discard: true }` only sends. How the client reaches the agent comes from the `Agents`
 reference:
 - by default, inside Cloudflare, the Durable Object binding, resolved from the Worker's
@@ -158,21 +159,65 @@ reference:
 - outside Cloudflare, `Api.connect({ url, token })` replaces it with the HTTP API (mounted with
   `Api.routes`)
 
-A send from inside a handler records the sender's task id as the causation. Waiting inside a
-handler fails with `AgentError` (`WaitingInHandler`) until M3. Waiting happens
-inside the Durable Object: a `wait` RPC parks on an in-memory waiter released when the settling
-transaction commits, and returns after 20 s at most. Callers loop, so an eviction only costs a
-re-read.
+Inside an agent (a handler, or a tool during a turn), calls go through the agent's outbox instead
+(see "Messages between agents" below). Outside one, waiting happens inside the recipient's
+Durable Object: a `wait` RPC parks on an in-memory waiter released when the settling transaction
+commits, and returns after 20 s at most. Callers loop, so an eviction only costs a re-read.
 
 **Deploys and version skew.** Right after a deploy, a Durable Object instance can still run the
 previous code for a few minutes. Callers must tolerate an instance that is one version behind:
 add RPC methods without removing old ones, and have callers fall back when a new method is
 missing. (`wait` falls back to reading the record.)
 
+## Messages between agents (implemented in M3)
+
+**Storage.** Two more tables in each agent's Durable Object. `alchemy_agent_outbox` holds the
+calls the agent makes (`kind = call`) and the replies it owes to others (`kind = reply`), each
+with a delivery status. `alchemy_agent_subscribers` holds, per task, who waits for its reply.
+
+**A call.** Inside an agent, the client hands each call to the `Calls` service. The n-th call of
+an execution is outbox row `<owner>#c<n>`. The owner is the task id for a handler, or
+`<turnId>/<toolCallId>` for a tool. The recipient's task id comes from the Rpc's `primaryKey`,
+or else is `<Type>/<name>/<row id>`. Either way a rerun produces the same ids, so it never sends
+twice. A handler must therefore make the same calls in the same order on every run. If a rerun
+makes a different call at the same position, it dies with an error that says so.
+
+- **Recorded with the outcome.** New calls are buffered during an execution and written in the
+  transaction that records its outcome: the task completing or suspending, or the tool's
+  result. A failed execution's calls are dropped; the retry makes them again. A call already
+  recorded returns at once: `undefined` for a discard, its recorded reply once it has one.
+- **Calls wait.** A call whose reply isn't recorded yet makes its owner wait: the
+  task becomes `waiting`, or the turn does when a tool made the call. Waiting holds no
+  execution. Concurrent calls (`Effect.all`) are all recorded before the owner starts waiting.
+
+**Delivery.** A durable callback (`alchemy-agent/outbox`) delivers due rows in order. For a call
+it runs `enqueue` on the recipient, and for a waiting call then `subscribe`. If the task has
+already settled, `subscribe` returns it and the reply is recorded at once. Otherwise the
+recipient records the subscriber. A failed delivery backs off, from 1 s up to 5 min. After 10
+failures, a waiting call gets `AgentError(Unreachable)` as its reply. A recipient still on
+pre-M3 code has no `subscribe`, so delivery fails and retries until the deploy finishes.
+
+**Replies.** The transaction that settles a task also turns its subscribers into `reply` rows in
+the recipient's outbox. Delivering one calls `reply` on the waiting agent. That records the
+reply on the call's row and resumes the owner, once, in one transaction: the task goes back to
+`pending`, or the turn schedules its next step. The handler (or the tool) then runs again and
+gets the recorded reply. Replies need the recipient's Worker to have the caller's binding,
+which holds when both agents are hosted in the same Worker.
+
+Because waiting holds nothing, agents can wait on each other in both directions (A → B → A)
+without deadlocking. The tests cover that, a parallel fan-out, a declared error crossing a wait,
+a waiting call to a task that already settled, and a crash after the reply arrived. Hello's
+deployed check covers a redeploy while an agent waits: the waiter has exactly one attempt
+afterwards.
+
+Lifecycle logs: `task.settled` and `message.sent` carry the causation. They go to Workers Logs.
+
+Not done yet: wait timeouts, and a per-agent allowlist of who may call whom.
+
 ## LLM turns (implemented in M2)
 
 **Storage.** Two more tables in the agent's Durable Object. `alchemy_agent_turns` holds one row
-per prompt: status `queued` / `running` / `completed` / `failed`, the message, the output schema,
+per prompt: status `queued` / `running` / `waiting` (a tool waits for another agent) / `completed` / `failed`, the message, the output schema,
 the system prompt, step, error and token counters, and the output. `alchemy_agent_transcript` holds one row per
 message (`user`, `model`, `tool_result`) per session, encoded with Effect AI's `Prompt.Message`
 schema.

@@ -71,6 +71,20 @@ test(
 );
 
 test(
+  "a tool delegates to another agent: the turn waits for its answer, then finishes with it",
+  viaApi(
+    Effect.gen(function* () {
+      const d = yield* desk(`delegate-${run}`);
+      expect(yield* d.Ask({ message: "delegate this", session: "d" })).toBe("Echo answered PSST");
+      const entries = yield* transcript(`delegate-${run}`, "d");
+      expect(entries.map((e) => e.kind)).toEqual(["user", "model", "tool_result", "model"]);
+      expect(JSON.stringify(entries[2]!.message)).toContain("PSST");
+    }),
+  ),
+  timeout,
+);
+
+test(
   "bad tool arguments become a failed tool result the model sees, not a failed turn",
   viaApi(
     Effect.gen(function* () {

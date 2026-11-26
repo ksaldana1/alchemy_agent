@@ -93,6 +93,12 @@ _Avoid_: Request, invoke, ask, delegate
 The result of a call, delivered back to the waiting caller.
 _Avoid_: Response, callback, answer
 
+**Outbox**:
+The table in an agent where its calls and the replies it owes wait to be delivered. A call is
+recorded there together with the outcome of the execution that made it, so a rerun never sends
+twice.
+_Avoid_: Queue, mailbox (the inbox is where tasks arrive)
+
 **Waiting**:
 The state of a task, session, or workflow run that has paused until something arrives: a reply,
 a person's response, a signal, or a time. Waiting work holds no execution.

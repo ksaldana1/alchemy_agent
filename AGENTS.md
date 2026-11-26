@@ -27,6 +27,11 @@ runs. Record the difference in `docs/spike/0.6-verified-facts.md`.
   `X.toLayer(X.of({ … }), { retry, toolkit, limits })`, `(yield* X.client)(name).Task(payload)`,
   and one `Agent.generate({ prompt, schema? })`. `docs/NORTH-STAR.md` shows the target. New API
   should look like Effect's, not like a framework of its own.
+- Inside an agent (handler or tool), client calls go through the outbox and are identified by
+  their position (`<owner>#c<n>`). A handler must make the same calls in the same order on every
+  run, and code before a waiting call can run more than once. Don't catch defects
+  (`catchCause`, `catchDefect`, `exit`) around client calls or `Agent.generate`: waiting is a
+  defect the runtime has to see.
 - No formatter is configured. Lines go up to about 140 columns. Don't run `prettier` with its
   defaults (80 columns).
 - A class-style `Context.Service` has no `.asEffect()`. Use `yield* Service` or

@@ -151,9 +151,30 @@ export class Generating extends Context.Service<
   { readonly run: (request: GenerateRequest) => Effect.Effect<unknown, GenerationError> }
 >()("alchemy-agent/Generating") {}
 
+/** One client call made inside an agent (a handler or a tool). */
+export interface CallRequest {
+  readonly agent: Address;
+  readonly tag: string;
+  /** From the Rpc's `primaryKey`; otherwise derived from the call's position, so a rerun sends nothing new. */
+  readonly taskId: string | undefined;
+  /** Encoded with the Rpc's payload schema. */
+  readonly payload: unknown;
+  readonly wait: boolean;
+}
+
+/**
+ * Client calls inside an agent go through its outbox: recorded with the outcome of the
+ * execution that made them, and delivered by a durable callback. A waiting call suspends the
+ * task (or the turn, from a tool) until the answer arrives. Provided by the runtime.
+ */
+export class Calls extends Context.Service<
+  Calls,
+  { readonly call: (request: CallRequest) => Effect.Effect<TaskRecord | undefined> }
+>()("alchemy-agent/Calls") {}
+
 /**
  * Raised (as a defect, so handler error handling doesn't swallow it) when a handler reaches an
- * unfinished turn: the task suspends and resumes when the turn settles.
+ * unfinished turn or call: the task suspends and resumes when it settles.
  */
 export class Suspend {
   readonly _tag = "alchemy-agent/Suspend";

@@ -240,6 +240,35 @@ free, but the routes are generic over agents, so it needs a design pass).
 - an A→B→A exchange does not deadlock
 - killing A mid-wait (redeploy) still resumes once
 
+**Status (2026-11-26): done, except wait timeouts and the allowlist.** Library:
+`internal/outbox.ts` (the outbox, its delivery callback, `subscribe` / `reply`), the `Calls`
+service in `internal/core.ts`, and its wiring in `internal/runtime.ts` and
+`internal/session.ts`. Tests: 6 new scenarios in `inbox.test.ts` and 1 in `llm.test.ts` (34 in
+all, local and on `test_$USER`). Deployed checks on `dev_$USER`:
+- Hello: `Introduce` waits for another greeter. `WaitForSlow` waits through a redeploy and the
+  waiter ends with one attempt (`hello:check <url> redeploy-start|redeploy-finish`).
+- Support desk: Helpdesk's `triage_ticket` tool waits for the Triage agent (itself an LLM agent).
+- A → B → A runs in the cloud suite.
+
+Changes from the plan above, and why:
+- **No `ask_<agent>` tool is generated.** A tool is ordinary code, and its handler can call any
+  client and wait, so a hand-written tool covers it with a typed result (see the support desk's
+  `triage_ticket`).
+- **The send's id comes from the call's position, not a step index.** The n-th call of an
+  execution is `<owner>#c<n>`. That makes it the same on a rerun, like `Agent.generate`'s turns.
+  A rerun that makes a different call at that position dies with an error that says so.
+- **A failed attempt's sends are dropped.** Calls commit with a completed or waiting outcome only.
+  The retry makes them again with the same ids.
+- **Replies are pushed, not polled.** The recipient keeps subscribers and owes a `reply` through
+  its own outbox. `subscribe` is a new RPC, so a recipient still on old code makes the delivery
+  retry until the deploy finishes.
+- **Sender identity:** causation is set by framework code in the calling Durable Object, and the
+  HTTP API always passes none. The per-agent allowlist is deferred until grants exist (M4).
+- **Wait timeouts are deferred.** They need a durable timer per waiting call. M7's human requests
+  need the same thing, so the two should be built together.
+- **Lifecycle logs:** `task.settled` and `message.sent` with causation, through Effect's logger
+  (Workers Logs). `session.step` isn't logged yet.
+
 ## M4: Workspace (permissioned files)
 
 - Logical paths `~/x`, `agents/<type>/<name>/x`, and `shared/...` map to R2 keys. `..` and absolute keys are rejected.
