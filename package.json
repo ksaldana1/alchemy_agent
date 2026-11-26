@@ -8,9 +8,10 @@
   ],
   "scripts": {
     "typecheck": "tsc -b",
-    "test": "bun test",
+    "test": "cd spikes && ALCHEMY_TEST_DEV=1 bun test",
+    "test:cloud": "cd spikes && bun test",
     "alchemy": "bun --cwd spikes --bun alchemy",
-    "dev": "bun --cwd spikes --bun alchemy dev",
+    "dev": "bun --cwd spikes --bun alchemy dev --stage local_$USER",
     "deploy": "bun --cwd spikes --bun alchemy deploy",
     "plan": "bun --cwd spikes --bun alchemy plan",
     "destroy": "bun --cwd spikes --bun alchemy destroy"
