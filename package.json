@@ -1,0 +1,16 @@
+{
+  "name": "alchemy-agent-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*", "spikes"],
+  "scripts": {
+    "typecheck": "tsc -b",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@alchemy.run/test": "2.0.0-beta.87",
+    "@types/bun": "1.4.5",
+    "expect-type": "1.4.0",
+    "typescript": "7.0.2"
+  }
+}
