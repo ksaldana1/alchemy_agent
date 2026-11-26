@@ -1,10 +1,9 @@
-// How the newsroom's agents do their work (docs/NORTH-STAR.md), on Workers AI.
+// How the newsroom's agents do their work (docs/NORTH-STAR.md). The LLM agents' Layers need a
+// model: `*Live` provides Workers AI; the chaos test provides a scripted model instead.
 import { Agent, AgentModel, Workspace } from "alchemy-agent";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { Editor, Intake, Reviewer, Verdict } from "./contracts.ts";
-
-const Model = AgentModel.workersAI("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
 
 export const IntakeLive = Intake.toLayer(
   Intake.of({
@@ -16,24 +15,28 @@ export const IntakeLive = Intake.toLayer(
   }),
 );
 
-export const EditorLive = Editor.toLayer(
+export const EditorAgent = Editor.toLayer(
   Editor.of({
-    // One durable LLM turn; the handler saves its answer to the editor's home.
+    // One durable LLM turn: the model reads the article and writes the edit with its workspace
+    // tools. Every model call and tool call is a checkpointed step.
     Edit: Effect.fn("Editor.Edit")(function* ({ payload: { path, name } }) {
-      const text = yield* Workspace.read(path);
-      const edited = yield* Agent.generate({
+      const target = `~/edited/${name}.md`;
+      const answer = yield* Agent.generate({
         system:
           "You are a copy editor. Fix grammar and spelling and tighten the prose. Never change facts. " +
-          "Reply with the edited article only, without any commentary.",
-        prompt: text,
+          "Use read_file to read the article and write_file to save your edited version.",
+        prompt: `Edit ${path} and save the edited article to ${target}. Then reply "done".`,
       });
-      return yield* Workspace.write(`~/edited/${name}.md`, edited.trim());
+      // A model that answered with the article instead of saving it: save its answer.
+      return yield* Workspace.stat(target).pipe(Effect.catchTag("FileNotFound", () => Workspace.write(target, answer.trim())));
     }),
     Share: ({ payload }) => Workspace.share(payload.path, payload.with, "read"),
   }),
-).pipe(Layer.provide(Model));
+  // The agent's tools (read / write / list / share, checked against its grants).
+  { toolkit: Workspace.Toolkit },
+).pipe(Layer.provide(Workspace.ToolkitLayer));
 
-export const ReviewerLive = Reviewer.toLayer(
+export const ReviewerAgent = Reviewer.toLayer(
   Reviewer.of({
     Review: Effect.fn("Reviewer.Review")(function* ({ payload: { path }, agent }) {
       // Without a grant this fails with FsDenied: a declared error, so the task settles.
@@ -48,4 +51,8 @@ export const ReviewerLive = Reviewer.toLayer(
       return { ...verdict, by: agent.name, path, revision: yield* Workspace.revision(path) };
     }),
   }),
-).pipe(Layer.provide(Model));
+);
+
+const Model = AgentModel.workersAI("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+export const EditorLive = EditorAgent.pipe(Layer.provide(Model));
+export const ReviewerLive = ReviewerAgent.pipe(Layer.provide(Model));

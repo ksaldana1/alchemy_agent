@@ -30,7 +30,10 @@
     "support:demo": "bun --cwd examples/support-desk scripts/demo.ts",
     "newsroom:deploy": "bun --cwd examples/newsroom --bun alchemy deploy --stage dev_$USER",
     "newsroom:destroy": "bun --cwd examples/newsroom --bun alchemy destroy --stage dev_$USER",
-    "newsroom:demo": "bun --cwd examples/newsroom scripts/demo.ts"
+    "newsroom:demo": "bun --cwd examples/newsroom scripts/demo.ts",
+    "newsroom:run": "bun --cwd examples/newsroom scripts/newsroom.ts",
+    "newsroom:test": "cd examples/newsroom && ALCHEMY_TEST_DEV=1 bun test",
+    "newsroom:test:cloud": "cd examples/newsroom && bun test"
   },
   "devDependencies": {
     "@alchemy.run/test": "2.0.0-beta.87",

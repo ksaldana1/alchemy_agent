@@ -13,6 +13,7 @@
 // workspace when grants are declared, the listeners (M6), and the HTTP API (`Api.routes`: agents, workflow runs and
 // signals, the workspace). The engine is given to the agents too, so their replies reach runs.
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Layer from "effect/Layer";
@@ -20,6 +21,9 @@ import type { WorkflowEngine } from "effect/workflow";
 import * as Api from "./Api.ts";
 import { HumansLive } from "./Human.ts";
 import * as Listeners from "./internal/listeners.ts";
+import * as PlatformClient from "./internal/platformClient.ts";
+import type * as HttpClient from "effect/http/HttpClient";
+import type * as Redacted from "effect/Redacted";
 import * as Registry from "./internal/registry.ts";
 import { trackRegistrations } from "./internal/workflow.ts";
 import type * as Listen from "./Listen.ts";
@@ -36,6 +40,8 @@ export interface Options {
   readonly workspace?: { readonly forceDestroy?: boolean };
   /** Listeners: `Listen.files(...)` / `Listen.cron(...)`, each `.start(workflow, …)` or `.send(agent, …)`. */
   readonly listeners?: ReadonlyArray<Listen.Listener>;
+  /** Services for every agent and workflow, e.g. a test platform's `Testing.chaos([...])`. */
+  readonly provide?: Layer.Layer<any, never, never>;
 }
 
 /**
@@ -62,7 +68,8 @@ export const layer = (options: Options): Layer.Layer<WorkflowEngine.WorkflowEngi
   if (listeners.length > 0) parts.push(Listeners.layer(listeners, { forceDestroy }) as Layer.Layer<any, never, any>);
   // provideMerge: the agents and workflows are built with the engine in their context, and the
   // engine stays available to the Worker (to start runs and send signals).
-  return Layer.mergeAll(...(parts as [Layer.Layer<any, never, any>])).pipe(Layer.provideMerge(engine)) as never;
+  const all = Layer.mergeAll(...(parts as [Layer.Layer<any, never, any>])).pipe(Layer.provideMerge(engine));
+  return (options.provide === undefined ? all : all.pipe(Layer.provide(options.provide as Layer.Layer<any, never, never>))) as never;
 };
 
 /** A Worker hosting the platform and serving its HTTP API (see `Api`). Yield it in your stack. */
@@ -75,7 +82,32 @@ export const make = (name: string, options: Options & { readonly main: string })
       return {
         fetch: Effect.gen(function* () {
           return (yield* api.handle) ?? HttpServerResponse.text("Not found", { status: 404 });
-        }),
+        }).pipe(
+          // A defect (e.g. a Durable Object not reachable yet right after a deploy) is a 503 that
+          // says why, and is logged; clients retry 503s.
+          Effect.catchCause((cause) =>
+            Effect.logError("api.defect", Cause.pretty(cause)).pipe(
+              Effect.andThen(HttpServerResponse.json({ error: "unavailable", message: Cause.pretty(cause).slice(0, 500) }, { status: 503 })),
+              Effect.orDie,
+            ),
+          ),
+        ),
       };
     }).pipe(Effect.provide(layer(options))),
   );
+
+// ---------------------------------------------------------------------------
+// From outside (scripts, tests)
+// ---------------------------------------------------------------------------
+
+export { Client, PlatformError, type HumanRequest, type Run, type RunStatus } from "./internal/platformClient.ts";
+
+/**
+ * Reach a deployed platform over its HTTP API: provides `Platform.Client` (files, human
+ * requests, workflow runs) and makes every agent client go over HTTP too (`Api.connect`).
+ */
+export const connect = (options: {
+  readonly url: string;
+  readonly token: string | Redacted.Redacted<string>;
+}): Layer.Layer<PlatformClient.Client, never, HttpClient.HttpClient> =>
+  Layer.merge(PlatformClient.layer(options), Api.connect(options));

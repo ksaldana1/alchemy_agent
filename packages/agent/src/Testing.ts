@@ -1,6 +1,22 @@
 // Test-only hooks: `import * as Testing from "alchemy-agent/testing"`.
 import * as Effect from "effect/Effect";
-import { CurrentExecution } from "./internal/core.ts";
+import * as Layer from "effect/Layer";
+import { ChaosPlan, CurrentExecution, type CrashRule } from "./internal/core.ts";
+
+export type { CrashRule };
+
+/**
+ * Plans a crash: the first delivery of `task` to an agent of this type (any name, or `name`)
+ * dies as its handler starts, the way an eviction would. The task is delivered again.
+ */
+export const crashOnce = (agent: { readonly type: string }, task: string, options?: { readonly name?: string }): CrashRule => ({
+  type: agent.type,
+  task,
+  name: options?.name,
+});
+
+/** The planned crashes, for a test platform: `Platform.make({ ..., provide: Testing.chaos([...]) })`. */
+export const chaos = (rules: ReadonlyArray<CrashRule>): Layer.Layer<any> => Layer.succeed(ChaosPlan, rules) as unknown as Layer.Layer<any>;
 
 /**
  * Ends the current execution abruptly, as an eviction or a CPU-limit reset would: the Durable

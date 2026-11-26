@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (2026-11-26):** principles, invariants, and what M1–M7 and the API reset built. The
+> **Status (2026-11-26):** principles, invariants, and what M1–M8 and the API reset built. The
 > rest of the component structure gets added as milestones land. The "Guiding decisions" table in
 > [PLAN.md](PLAN.md) is the working design for what isn't built yet.
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
@@ -338,6 +338,20 @@ its call's position, a rerun or a replay finds the same request.
 report to once per activation when they get a new task (best effort, eventually consistent).
 `GET /agents/:type/:name/tasks?status=` lists an agent's inbox. `GET /requests?status=` lists
 human requests by state.
+
+## From outside, and under test (M8)
+
+**`Platform.connect({ url, token })`** provides `Platform.Client` and routes agent clients over
+HTTP. Its streams poll the API: `requests.stream` emits each pending human request made since
+the client connected, and `runs(workflow)` emits each run listeners started since then, read
+from the listener log. Network failures, 502–504, and a 404 from the edge (not the API's own
+JSON) are retried. `Platform.make` turns a defect while handling a request into a 503 with its
+message.
+
+**Chaos.** `Testing.crashOnce(Agent, "Task")` rules, provided with
+`Platform.make({ provide: Testing.chaos([...]) })`, make the first delivery of that task to that
+agent abort its Durable Object as the handler starts, counted durably (once per agent). The
+drain then finds the task `running`: a lost attempt, delivered again.
 
 ## LLM turns (implemented in M2)
 

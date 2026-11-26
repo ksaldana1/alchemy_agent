@@ -21,6 +21,7 @@ import {
   AgentContext,
   AgentErrorReason,
   Calls,
+  ChaosPlan,
   CurrentExecution,
   ExecutionLost,
   ExternalTask,
@@ -117,6 +118,7 @@ export const agentObject = (config: HostConfig) => {
     // user's own services) is in this context; handlers and steps run with it.
     const context = yield* Effect.context<never>();
     const handlers = (Effect.isEffect(config.build) ? yield* config.build : config.build) as Record<string, Handler>;
+    const chaos = Context.get(context, ChaosPlan);
     // A model is either a plain LanguageModel or one built inside each step (AgentModel.workersAI).
     const deferredModel = Context.getOption(context, DeferredModel);
     const hasModel = Option.isSome(deferredModel) || Option.isSome(Context.getOption(context, LanguageModel.LanguageModel));
@@ -276,6 +278,14 @@ export const agentObject = (config: HostConfig) => {
         const payload = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(json(rpc.payloadSchema)))(row.input).pipe(Effect.result);
         if (payload._tag === "Failure") {
           return { _tag: "Failed", permanent: true, error: agentFailure(new InvalidPayload({ message: payload.failure.message })) } as Outcome;
+        }
+        // Tests only (`Testing.chaos`): the first delivery of a planned task to this agent dies,
+        // as an eviction or a CPU-limit reset would. The durable counter makes it once.
+        if (chaos.some((r) => r.type === type && r.task === row.task && (r.name === undefined || r.name === agent.name))) {
+          if ((yield* execution.count(`chaos:${row.task}`)) === 1) {
+            execution.abort(`chaos: ${type}/${agent.name}.${row.task}`);
+            return yield* Effect.never;
+          }
         }
         let services = Context.merge(context, Context.make(AgentContext, { agent, taskId: row.task_id, attempt }));
         if (hasModel) services = Context.add(services, Generating, generating(row));

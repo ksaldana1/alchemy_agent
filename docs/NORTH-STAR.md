@@ -294,8 +294,9 @@ test("every step takes effect once under chaos", Effect.gen(function* () {
 
 ## How far today's code is from this
 
-As of 2026-11-26 the API reset and M3 to M7 are done, and the library has the shape above for
-what M1 to M7 cover:
+As of 2026-11-26 every milestone (M1 to M8) is done. `examples/newsroom` is this document's
+newsroom, with its acceptance test (`examples/newsroom/test/`) and its demo
+(`scripts/newsroom.ts`, on `Platform.Client`). The library has this shape:
 
 - `Rpc` contracts and `Agent.make(type, [rpcs])`
 - `X.of` and `X.toLayer(impl, { retry, toolkit, limits })`
@@ -318,8 +319,14 @@ The Hello and support desk examples are written this way.
 Not yet:
 
 - **Wait timeouts and a per-agent allowlist** of who may call whom (left out of M3).
-- **The rest:** the typed `Platform.Client` with its run and request streams (the demo
-  script uses plain HTTP), `Chaos.*`, and `HttpApi`.
+- **Differences that remain (M8):**
+  - `Edit` returns the `FileRef` its handler reads after the turn. It doesn't use
+    `schema: Workspace.FileRef`.
+  - Chaos is declared on a test platform (`Testing.chaos([Testing.crashOnce(Editor, "Edit")])`)
+    rather than called as `Chaos.*`.
+  - `run.step(…)` is `run.tasksOn(address)`.
+  - The reviewer runs on Workers AI, not Anthropic.
+  - The HTTP API doesn't use `HttpApi`.
 - **`HttpApi`.** The HTTP API is still routed by hand and doesn't use it.
 
 ## What is invented beyond the plan

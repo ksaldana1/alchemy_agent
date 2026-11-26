@@ -137,6 +137,15 @@ export class Agents extends Context.Reference<{
 /** Set by `internal/client.ts` (avoids an import cycle). */
 export const bindingTransportRef: { current: ((agent: Address) => Transport) | undefined } = { current: undefined };
 
+/** A planned crash (tests only): the first delivery of `task` to an agent of `type` (and `name`) dies. */
+export interface CrashRule {
+  readonly type: string;
+  readonly task: string;
+  readonly name: string | undefined;
+}
+/** The crashes a test platform plans (`Testing.chaos`). Empty everywhere else. */
+export const ChaosPlan = Context.Reference<ReadonlyArray<CrashRule>>("alchemy-agent/ChaosPlan", { defaultValue: () => [] });
+
 /** The current task execution (tests crash and count with it; the wait guard reads it). */
 export const CurrentExecution = Context.Reference<
   | {

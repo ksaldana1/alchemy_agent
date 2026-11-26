@@ -32,6 +32,9 @@
         "alchemy-agent": "workspace:*",
         "effect": "4.1.5",
       },
+      "devDependencies": {
+        "@alchemy.run/test": "2.0.0-beta.87",
+      },
     },
     "examples/support-desk": {
       "name": "support-desk",

@@ -485,6 +485,46 @@ Scripted chaos: a handler throws mid-turn, a redeploy happens mid-run, and the s
 delivered twice. Each logical step must take effect once. The agent and workflow code must
 contain no infrastructure code and be shorter than `mini-agent-runtime/examples/newsroom/`.
 
+**Status (2026-11-26): done, except the size bar.** `examples/newsroom` is the north star's
+newsroom. Library additions: `Platform.connect` / `Platform.Client` (files, `requests.stream`
+with `respond`, `runs(workflow)` with typed `result` and `tasksOn(agent)`, `listeners.replay`),
+`Testing.chaos([Testing.crashOnce(Agent, "Task")])` with `Platform.make({ provide })`, and API
+defects becoming 503s (which clients retry).
+- **The acceptance test** (`bun run newsroom:test[:cloud]`, `examples/newsroom/test/`): the
+  same agents, workflow, grants, and listener on a scripted model, with a planned crash of the
+  editor's first edit. Three submissions, each storage event delivered at least twice (real
+  notifications plus replays in the cloud; two replays locally), and the test signs off each
+  request as it appears. It checks: three runs and three published files; every delivery of a
+  file names one run; edit attempts `[1, 1, 2]`; each junior review a declared `FsDenied`,
+  each senior review approved at 1 attempt; the published text is the editor's. It passes
+  locally and on `test_$USER`.
+- **The deployed run** (`bun run newsroom:run <url>`, Workers AI, `dev_$USER`): three uploads plus
+  a replayed event each, the script playing the person, and a `--force` redeploy landing
+  mid-run. It produced three runs, three published articles (edits at 1 attempt, junior denied,
+  senior approved), and the typos fixed. The Llama editor used its tools (`read_file`, then
+  `write_file`) in all three turns.
+
+Changes and gaps, and why:
+- **The editor is a tool-using turn**, as planned. The handler then `stat`s the file it was told
+  to write, and falls back to saving the model's answer if the model didn't use `write_file`.
+  It returns that `FileRef`, instead of the north star's `schema: Workspace.FileRef`, which asks a
+  small model to repeat an etag exactly.
+- **Chaos is declared on a test platform** (`provide: Testing.chaos([...])`), not called from the
+  test as `Chaos.crashOnce(...)`. The plan is a Layer the agents read when they're built. The crash
+  happens as the handler starts, before the turn. A crash between steps of a turn is covered by
+  M2's tests. **The redeploy chaos is in the deployed run, not the test.** The test framework can't
+  redeploy a stack mid-test with new code. M5 and M7 checked redeploys mid-wait too.
+- **`run.step("Edit").attempts` is `run.tasksOn(Editor.address("desk"))`:** steps aren't indexed
+  by name, but each agent's inbox is, by the run's causation.
+- **The size bar isn't met.** The app code (`src/`: contracts, agents, workflow, platform) is
+  198 lines (156 without blanks and comments). The reference's three agents and `main.ts` are
+  130 (109). It does more: an LLM editor and reviewers, typed contracts and errors, sign-off bound
+  to a revision, publishing, and a listener. The extra lines are mostly the contracts (28 code
+  lines, which the reference doesn't have) and the workflow's error handling (mapping
+  `NotApproved` / `RequestExpired` / `RequestCanceled` and `AgentError`, about 12).
+- **Not done:** the Anthropic reviewer through `AgentModel.gateway` (needs a key), `HttpApi`
+  for the HTTP API, and a push feed (the client polls).
+
 ## Later
 
 - Generated agents through Worker Loader (`globalOutbound: null`) with a scoped ctx
